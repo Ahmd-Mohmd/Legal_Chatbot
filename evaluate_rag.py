@@ -2,18 +2,17 @@
 """
 RAG Evaluation Script using Ragas Metrics
 ==========================================
-Evaluates the Constitutional Legal Assistant using:
+Evaluates the Egyptian Legal Assistant (multi-law RAG) using:
 - faithfulness
 - answer_relevancy
 - context_precision
 - context_recall
-- context_relevancy
 
 USAGE:
 ------
 1. Command line: python evaluate_rag.py path/to/questions.json
 2. Environment variable: set QA_FILE_PATH=path/to/questions.json
-3. Default: Place 'test_dataset.json' in same directory
+3. Default: Place 'test_dataset_5_questions.json' in same directory
 
 JSON FORMAT:
 -----------
@@ -22,15 +21,16 @@ OR dict format: {"data": [...]} or {"questions": [...]}
 
 RATE LIMITS:
 -----------
-- 120 second delay between questions to avoid API timeouts
-- 30 second delay before evaluation starts
-- 15 second initial cooldown after pipeline load
+- Uses DUAL Groq API keys (GROQ_API_KEY + groq_api) with round-robin rotation
+- This effectively doubles the rate limit, allowing shorter delays
+- Delays are tuned conservatively to avoid 429 errors
 """
 
 import os
 import sys
 import json
 import time
+import itertools
 from dotenv import load_dotenv
 from datasets import Dataset
 from ragas import evaluate
@@ -45,6 +45,10 @@ from ragas.embeddings import LangchainEmbeddingsWrapper
 from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
 import logging
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ragas.llms import LangchainLLMWrapper as LangchainLLMWrapperType
 
 # Import the RAG pipeline initialization
 from app_final_updated import initialize_rag_pipeline
@@ -54,22 +58,53 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("groq").setLevel(logging.WARNING)
 
 load_dotenv()
-model_name="Omartificial-Intelligence-Space/GATE-AraBert-v1"
-# ==========================================
-# ⏱️ RATE LIMITING / DELAYS (GROQ LIMITS)
-# ==========================================
-RPM_LIMIT = 30
-TPM_LIMIT = 6000
-RPD_LIMIT = 14400
-TPD_LIMIT = 500000
+model_name = "Omartificial-Intelligence-Space/GATE-AraBert-v1"
 
-# Use a conservative delay to stay within RPM limits.
-# Increased delays to prevent API timeouts
-MIN_DELAY_SECONDS = 60.0 / RPM_LIMIT
-REQUEST_DELAY_SECONDS = 60.0  # 1 minute between each question to avoid timeouts
-EVALUATION_DELAY_SECONDS = 60.0  # 60 seconds before starting evaluation
-INITIAL_COOLDOWN = 10.0  # 10 seconds after loading pipeline
-PER_METRIC_DELAY = 60.0  # 60 seconds between evaluating each question's metrics
+# ==========================================
+# 🔑 DUAL API KEY SETUP (round-robin to double rate limits)
+# ==========================================
+GROQ_API_KEYS = []
+_key1 = os.getenv("GROQ_API_KEY")
+_key2 = os.getenv("groq_api")
+if _key1:
+    GROQ_API_KEYS.append(_key1)
+if _key2:
+    GROQ_API_KEYS.append(_key2)
+if not GROQ_API_KEYS:
+    raise RuntimeError("No Groq API keys found in .env (need GROQ_API_KEY and/or groq_api)")
+
+print(f"🔑 Loaded {len(GROQ_API_KEYS)} Groq API key(s) — {'dual-key rotation enabled' if len(GROQ_API_KEYS) > 1 else 'single key mode'}")
+
+# Round-robin key iterator
+_key_cycle = itertools.cycle(GROQ_API_KEYS)
+
+def next_api_key() -> str:
+    """Get the next API key in round-robin rotation."""
+    return next(_key_cycle)
+
+def make_evaluator_llm():
+    """Create an evaluator LLM using the next API key in rotation.
+    Matches app_final_updated.py: llama-3.3-70b-versatile, temp=0.2, top_p=0.85"""
+    return LangchainLLMWrapper(ChatGroq(
+        groq_api_key=next_api_key(),
+        model="llama-3.3-70b-versatile",
+        temperature=0.2,
+        max_tokens=2048,
+        model_kwargs={"top_p": 0.85},
+        max_retries=5,
+        request_timeout=120,
+    ))
+# ==========================================
+# ⏱️ RATE LIMITING / DELAYS (tuned for DUAL-KEY rotation)
+# ==========================================
+# With 2 keys we get ~60 RPM combined, so delays can be shorter.
+NUM_KEYS = len(GROQ_API_KEYS)
+EFFECTIVE_RPM = 30 * NUM_KEYS          # 30 RPM per key
+
+REQUEST_DELAY_SECONDS  = 30.0 / NUM_KEYS   # 15s with 2 keys (was 60s)
+EVALUATION_DELAY_SECONDS = 20.0 / NUM_KEYS  # 10s with 2 keys (was 60s)
+INITIAL_COOLDOWN       = 5.0                # 5s after loading pipeline (was 10s)
+PER_METRIC_DELAY       = 30.0 / NUM_KEYS    # 15s with 2 keys (was 60s)
 
 # ==========================================
 # 📝 TEST DATASET
@@ -239,22 +274,17 @@ def run_evaluation():
     # 4. Run Ragas Evaluation
     print("\n⚙️ Running Ragas evaluation...")
     print("This may take a few minutes...")
-    print("Using Groq API (Llama 3.1 8B Instant) for evaluation...")
+    print(f"Using Groq API (llama-3.3-70b-versatile) with {NUM_KEYS} key(s) for evaluation...")
 
-    # Add a larger delay before evaluation to avoid back-to-back bursts
-    print(f"⏳ Waiting {EVALUATION_DELAY_SECONDS} seconds before evaluation...")
+    # Add a delay before evaluation to avoid back-to-back bursts
+    print(f"⏳ Waiting {EVALUATION_DELAY_SECONDS:.0f} seconds before evaluation...")
     time.sleep(EVALUATION_DELAY_SECONDS)
     
-    # Configure Groq LLM for evaluation (same as app_final.py)
-    evaluator_llm = LangchainLLMWrapper(ChatGroq(
-        model="llama-3.1-8b-instant",  # Same as app_final.py
-        temperature=0.3,  # Same as app_final.py
-        model_kwargs={"top_p": 0.9},  # Same as app_final.py
-        max_retries=3  # Add retries for robustness
-    ))
+    # Configure Groq LLM for evaluation (matches app_final_updated.py)
+    evaluator_llm = make_evaluator_llm()
     
-    # Configure embeddings (same as app_final.py)
-    print("Configuring HuggingFace embeddings (same as app_final.py)...")
+    # Configure embeddings (same as app_final_updated.py)
+    print("Configuring HuggingFace embeddings (same as app_final_updated.py)...")
     evaluator_embeddings = LangchainEmbeddingsWrapper(HuggingFaceEmbeddings(
         model_name=model_name
     ))
@@ -286,6 +316,9 @@ def run_evaluation():
                 "ground_truth": [results["ground_truth"][q_idx]]
             }
             single_dataset = Dataset.from_dict(single_q_data)
+            
+            # Rotate to fresh API key for each question evaluation
+            evaluator_llm = make_evaluator_llm()
             
             # Evaluate all metrics for this question
             try:
@@ -386,9 +419,12 @@ def run_evaluation():
                 "test_samples": len(dataset),
                 "overall_average": overall_avg,
                 "evaluation_details": {
-                    "delay_per_question": f"{REQUEST_DELAY_SECONDS}s",
-                    "delay_per_metric": f"{PER_METRIC_DELAY}s",
-                    "model": "llama-3.1-8b-instant",
+                    "delay_per_question": f"{REQUEST_DELAY_SECONDS:.1f}s",
+                    "delay_per_metric": f"{PER_METRIC_DELAY:.1f}s",
+                    "num_api_keys": NUM_KEYS,
+                    "model": "llama-3.3-70b-versatile",
+                    "temperature": 0.2,
+                    "top_p": 0.85,
                     "embeddings": model_name
                 }
             }
@@ -499,7 +535,8 @@ if __name__ == "__main__":
     
     print("\n" + "="*60)
     print("🎯 RAG EVALUATION SYSTEM")
-    print("   Constitutional Legal Assistant - Egyptian Constitution")
+    print("   Egyptian Legal Assistant — Multi-Law RAG")
+    print(f"   API Keys: {len(GROQ_API_KEYS)} (dual-key rotation {'ON' if len(GROQ_API_KEYS) > 1 else 'OFF'})")
     print("="*60)
     print(f"\n⏰ Started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     
