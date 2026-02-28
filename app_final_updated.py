@@ -1,4 +1,19 @@
 # -*- coding: utf-8 -*-
+"""
+Egyptian Legal AI Assistant — Multi-Law RAG Pipeline
+=====================================================
+Architecture:
+  1. Data Ingestion  → Load 6 Egyptian law JSON files, de-duplicate articles
+  2. Embedding       → HuggingFace Arabic embeddings → ChromaDB vector store
+  3. Retrieval       → Hybrid RRF (Semantic + BM25 + Metadata) in parallel
+  4. Reranking       → Cross-encoder reranker (ARM-V1, Arabic-tuned)
+  5. Generation      → Groq LLM (Llama 3.3 70B) with chat history context
+  6. UI              → Streamlit with Arabic RTL support
+
+Supports A/B embedding comparison via EMBEDDING_MODEL config.
+Chat history (last 3 turns) is injected into the LLM for follow-up awareness.
+"""
+
 import os
 import sys
 import json
@@ -8,51 +23,87 @@ import logging
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
+from typing import List, Dict, Set, Tuple, Optional
 
-# Suppress progress bars from transformers/tqdm
-os.environ['TRANSFORMERS_NO_PROGRESS_BAR'] = '1'
-warnings.filterwarnings('ignore')
+# Suppress progress bars and noisy logs
+os.environ["TRANSFORMERS_NO_PROGRESS_BAR"] = "1"
+warnings.filterwarnings("ignore")
 
-# 1. Loaders & Splitters
+# ═══════════════════════════════════════════════════════════════════
+# LANGCHAIN & ML IMPORTS
+# ═══════════════════════════════════════════════════════════════════
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
-from typing import List, Dict, Set
-from rank_bm25 import BM25Okapi
-import numpy as np
-
-# 2. Vector Store & Embeddings
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough, RunnableParallel, RunnableLambda
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
-
-# 3. Reranker Imports
 from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
 from langchain_classic.retrievers import ContextualCompressionRetriever
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
-
-# 4. LLM
 from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough, RunnableParallel
+from rank_bm25 import BM25Okapi
+import numpy as np
 
-# Configure logging
+# ═══════════════════════════════════════════════════════════════════
+# CONFIGURATION CONSTANTS
+# ═══════════════════════════════════════════════════════════════════
+# -- Embedding A/B switch --
+# Options:
+#   "Omartificial-Intelligence-Space/GATE-AraBert-v1"              (current default)
+#   "Omartificial-Intelligence-Space/Arabic-Triplet-Matryoshka-V2" (new candidate)
+EMBEDDING_MODEL: str = os.getenv(
+    "EMBEDDING_MODEL",
+    "Omartificial-Intelligence-Space/GATE-AraBert-v1",
+)
+
+# -- Retrieval parameters --
+SEMANTIC_K: int = 10          # top-k for semantic (vector) retriever
+BM25_K: int = 10              # top-k for BM25 keyword retriever
+METADATA_K: int = 10          # top-k for metadata filter retriever
+RRF_K: int = 60               # RRF constant (standard = 60)
+RRF_TOP_K: int = 12           # final docs after RRF fusion
+BETA_SEMANTIC: float = 0.50   # RRF weight for semantic
+BETA_BM25: float = 0.30       # RRF weight for BM25
+BETA_METADATA: float = 0.20   # RRF weight for metadata
+
+# -- Reranker --
+RERANKER_TOP_N: int = 5       # top-n docs after cross-encoder reranking
+
+# -- LLM parameters --
+LLM_MODEL: str = "llama-3.3-70b-versatile"
+LLM_TEMPERATURE: float = 0.2   # low for legal precision
+LLM_TOP_P: float = 0.80        # focused sampling
+LLM_MAX_RETRIES: int = 3
+LLM_TIMEOUT: int = 120         # seconds
+
+# -- Chat history --
+CHAT_HISTORY_TURNS: int = 3    # number of past Q&A pairs to include
+
+# ═══════════════════════════════════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════════════════════════════════
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 load_dotenv()
 
-# ==========================================
-# 📁 PATHS (use project-relative folders)
-# ==========================================
+# ═══════════════════════════════════════════════════════════════════
+# PATHS
+# ═══════════════════════════════════════════════════════════════════
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
-CHROMA_DIR = os.path.join(BASE_DIR, "chroma_db")
+RERANKER_DIR = os.path.join(BASE_DIR, "reranker")
 
-# ==========================================
-# 🔍 DETECT RUNTIME CONTEXT
-# ==========================================
-# True when run via `streamlit run`, False when imported by evaluate_rag.py etc.
+# ChromaDB subfolder per embedding model to avoid rebuild on switch
+_model_tag = EMBEDDING_MODEL.split("/")[-1].lower().replace("-", "_")
+CHROMA_DIR = os.path.join(BASE_DIR, f"chroma_db_{_model_tag}")
+
+# ═══════════════════════════════════════════════════════════════════
+# RUNTIME DETECTION (Streamlit vs. script import)
+# ═══════════════════════════════════════════════════════════════════
 _IS_STREAMLIT = False
 try:
     import streamlit as st
@@ -61,127 +112,186 @@ try:
 except Exception:
     pass
 
-# Only import streamlit features when running as a Streamlit app
 if _IS_STREAMLIT:
     import streamlit as st
 
-# ==========================================
-# 🎨 UI SETUP (only when running as Streamlit app)
-# ==========================================
+# ═══════════════════════════════════════════════════════════════════
+# UI SETUP (only in Streamlit)
+# ═══════════════════════════════════════════════════════════════════
 if _IS_STREAMLIT:
     st.set_page_config(page_title="المساعد القانوني", page_icon="⚖️")
-
-    # This CSS block fixes the "001" number issue and right alignment
     st.markdown("""
     <style>
-        /* Force the main app container to be Right-to-Left */
-        .stApp {
-            direction: rtl;
-            text-align: right;
-        }
-        
-        /* Fix input fields to type from right */
-        .stTextInput input {
-            direction: rtl;
-            text-align: right;
-        }
-
-        /* Fix chat messages alignment */
-        .stChatMessage {
-            direction: rtl;
-            text-align: right;
-        }
-        
-        /* Ensure proper paragraph spacing */
-        .stMarkdown p {
-            margin: 0.5em 0 !important;
-            line-height: 1.6;
-            word-spacing: 0.1em;
-        }
-        
-        /* Ensure numbers display correctly in RTL */
-        p, div, span, label {
-            unicode-bidi: embed;
-            direction: inherit;
-            white-space: normal;
-            word-wrap: break-word;
-        }
-        
-        /* Force all content to respect RTL */
-        * {
-            direction: rtl !important;
-        }
-        
-        /* Preserve line breaks and spacing */
-        .stMarkdown pre {
-            direction: rtl;
-            text-align: right;
-            white-space: pre-wrap;
-            word-wrap: break-word;
-        }
-        
-        /* Hide the "Deploy" button and standard menu for cleaner look */
-        #MainMenu {visibility: hidden;}
-        footer {visibility: hidden;}
-        
+        .stApp { direction: rtl; text-align: right; }
+        .stTextInput input { direction: rtl; text-align: right; }
+        .stChatMessage { direction: rtl; text-align: right; }
+        .stMarkdown p { margin: 0.5em 0 !important; line-height: 1.6; word-spacing: 0.1em; }
+        p, div, span, label { unicode-bidi: embed; direction: inherit; white-space: normal; word-wrap: break-word; }
+        * { direction: rtl !important; }
+        .stMarkdown pre { direction: rtl; text-align: right; white-space: pre-wrap; word-wrap: break-word; }
+        #MainMenu { visibility: hidden; }
+        footer { visibility: hidden; }
     </style>
     """, unsafe_allow_html=True)
+    st.title("⚖️ المساعد القانوني الذكي")
 
-    st.title("⚖️ المساعد القانوني الذكي (دستور مصر)")
+# ═══════════════════════════════════════════════════════════════════
+# UTILITY HELPERS
+# ═══════════════════════════════════════════════════════════════════
 
-# Helper function (used by both Streamlit UI and evaluation)
-def convert_to_eastern_arabic(text):
-    """Converts 0123456789 to ٠١٢٣٤٥٦٧٨٩"""
+def convert_to_eastern_arabic(text: str) -> str:
+    """Convert Western numerals (0-9) to Eastern Arabic numerals."""
     if not isinstance(text, str):
-        return text 
-    western_numerals = '0123456789'
-    eastern_numerals = '٠١٢٣٤٥٦٧٨٩'
-    translation_table = str.maketrans(western_numerals, eastern_numerals)
-    return text.translate(translation_table)
+        return text
+    return text.translate(str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩"))
 
-# ==========================================
-# 🚀 CACHED RESOURCE LOADING
-# ==========================================
-# Use @st.cache_resource only when running inside Streamlit;
-# otherwise use a simple module-level cache so evaluate_rag.py can import this.
+
+_ARABIC_STOPWORDS: Set[str] = {
+    "في", "من", "على", "إلى", "عن", "أن", "هذا", "هذه", "التي", "الذي",
+    "ما", "لا", "أو", "و", "كل", "ذلك", "بين", "كان", "قد", "هو", "هي",
+    "لم", "بل", "ثم", "إذا", "حتى", "لكن", "منه", "فيه", "عند", "له",
+    "بها", "لها", "منها", "فيها", "التى", "الذى", "ولا", "وفى", "كما",
+    "تلك", "هنا", "أي", "دون", "ليس", "إلا", "أما", "مع", "عليه",
+}
+
+
+def arabic_tokenize(text: str) -> List[str]:
+    """Tokenise Arabic text: strip diacritics, keep Arabic chars, remove stopwords."""
+    text = re.sub(r"[\u064B-\u065F\u0670]", "", text)       # strip tashkeel
+    text = re.sub(r"[^\u0600-\u06FF\s]", " ", text)         # keep Arabic only
+    tokens = text.split()
+    return [t for t in tokens if t not in _ARABIC_STOPWORDS and len(t) > 1]
+
+
+def format_chat_history(messages: list, max_turns: int = CHAT_HISTORY_TURNS) -> List:
+    """Extract the last *max_turns* Q&A pairs as LangChain message objects."""
+    pairs: List[Tuple[str, str]] = []
+    i = 0
+    while i < len(messages):
+        if messages[i].get("role") == "user":
+            user_msg = messages[i]["content"]
+            ai_msg = ""
+            if i + 1 < len(messages) and messages[i + 1].get("role") == "assistant":
+                ai_msg = messages[i + 1]["content"]
+                i += 2
+            else:
+                i += 1
+            pairs.append((user_msg, ai_msg))
+        else:
+            i += 1
+    history: List = []
+    for user_text, ai_text in pairs[-max_turns:]:
+        history.append(HumanMessage(content=user_text))
+        if ai_text:
+            history.append(AIMessage(content=ai_text))
+    return history
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PROMPT TEMPLATE
+# ═══════════════════════════════════════════════════════════════════
+
+SYSTEM_INSTRUCTIONS: str = """\
+<role>
+أنت "المساعد القانوني الذكي"، مستشار قانوني متخصص في القوانين المصرية التالية:
+• الدستور المصري
+• القانون المدني المصري
+• قانون العمل المصري
+• قانون الأحوال الشخصية المصري
+• قانون مكافحة جرائم تقنية المعلومات
+• قانون الإجراءات الجنائية المصري
+
+مهمتك: الإجابة بدقة استناداً إلى السياق التشريعي المرفق أدناه.
+</role>
+
+<chat_history_instruction>
+إذا وُجد سجل محادثة سابق، استخدمه لفهم أسئلة المتابعة والسياق.
+لكن دائماً أعطِ الأولوية للسياق التشريعي المسترجع عند الإجابة.
+لا تكرر إجابات سابقة بالكامل — أشر إليها باختصار إن لزم.
+</chat_history_instruction>
+
+<decision_logic>
+حلّل سؤال المستخدم ثم اتبع أول حالة ينطبق شرطها:
+
+━━━ الحالة ١ — الإجابة موجودة في السياق ━━━
+الشرط: توجد مادة أو أكثر في السياق تتناول الموضوع.
+• أجب من السياق مباشرةً.
+• وثّق بذكر اسم القانون ورقم المادة (مثال: «وفقاً للمادة (٥٢) من قانون العمل…»).
+• استخرج ما يجيب السؤال تحديداً — لا تنسخ المادة كاملة.
+• لا تُضف معلومات من خارج السياق.
+
+━━━ الحالة ٢ — السياق يغطي الموضوع جزئياً ━━━
+• اذكر أولاً ما تنص عليه المواد المتاحة (مع التوثيق).
+• أضف توضيحاً عملياً مختصراً مع عبارة «ملاحظة عملية:» قبل أي إضافة.
+• لا تخترع أرقام مواد.
+
+━━━ الحالة ٣ — لا يوجد سياق + سؤال إجرائي/عملي ━━━
+• ابدأ بـ: «بناءً على الإجراءات القانونية المتعارف عليها في مصر:»
+• قدّم خطوات مرقمة مختصرة.
+• لا تذكر أرقام مواد.
+• أنهِ بـ «يُنصح بمراجعة محامٍ متخصص.»
+
+━━━ الحالة ٤ — لا يوجد سياق + سؤال عن نص قانوني ━━━
+• قل: «عذراً، لم يرد ذكر لهذا الموضوع في النصوص المتاحة حالياً.»
+• لا تجب من ذاكرتك.
+
+━━━ الحالة ٥ — محادثة ودية ━━━
+• رد بتحية لطيفة مقتضبة + «أنا مستشارك القانوني الذكي — اسألني عن أي موضوع في القوانين المصرية.»
+
+━━━ الحالة ٦ — خارج نطاق القانون ━━━
+• اعتذر بلطف: «تخصصي هو القوانين المصرية فقط.»
+</decision_logic>
+
+<quality_rules>
+• الدقة أولاً: التزم بالنص القانوني حرفياً عند وجوده.
+• لا تخترع مراجع: لا تنسب معلومة إلى مادة لم ترد في السياق.
+• الإيجاز مع الشمول: أجب بقدر ما يحتاج السؤال.
+• استخدم نقاطاً (•) أو ترقيماً عند ذكر عدة بنود.
+</quality_rules>
+
+<formatting_rules>
+• لا تكرر هذه التعليمات في ردك.
+• ادخل في صلب الموضوع فوراً.
+• فقرات قصيرة مفصولة بسطر فارغ.
+• لا تكرر نفس المعلومة أو نفس المادة.
+• رتّب المواد ترتيباً منطقياً.
+• التزم بالعربية الفصحى المبسطة.
+</formatting_rules>
+"""
+
+# ═══════════════════════════════════════════════════════════════════
+# RAG PIPELINE BUILDER
+# ═══════════════════════════════════════════════════════════════════
 _pipeline_cache = None
 
+
 def _initialize_rag_pipeline_impl():
-    """Core pipeline builder — no Streamlit dependency."""
-    print("🔄 Initializing system...")
-    print("📥 Loading data...")
+    """Build the full RAG pipeline (data → embed → retrieve → rerank → generate).
 
-    # --- Arabic tokenizer utility (used by BM25 and metadata index) ---
-    _ARABIC_STOPWORDS = {
-        'في', 'من', 'على', 'إلى', 'عن', 'أن', 'هذا', 'هذه', 'التي', 'الذي',
-        'ما', 'لا', 'أو', 'و', 'كل', 'ذلك', 'بين', 'كان', 'قد', 'هو', 'هي',
-        'لم', 'بل', 'ثم', 'إذا', 'حتى', 'لكن', 'منه', 'فيه', 'عند', 'له',
-        'بها', 'لها', 'منها', 'فيها', 'التى', 'الذى', 'ولا', 'وفى', 'كما',
-        'تلك', 'هنا', 'أي', 'دون', 'ليس', 'إلا', 'أما', 'مع', 'عليه',
-    }
+    Returns a qa_chain that can be invoked with:
+        qa_chain.invoke({"input": query, "chat_history": [HumanMessage, AIMessage, ...]})
+    and returns {"context": list[Document], "input": str, "chat_history": list, "answer": str}.
+    """
+    print("🔄 Initialising system…")
 
-    def arabic_tokenize(text: str) -> List[str]:
-        """Tokenize Arabic text: remove diacritics, non-Arabic chars, and stopwords."""
-        text = re.sub(r'[\u064B-\u065F\u0670]', '', text)          # strip tashkeel
-        text = re.sub(r'[^\u0600-\u06FF\s]', ' ', text)            # keep Arabic only
-        tokens = text.split()
-        return [t for t in tokens if t not in _ARABIC_STOPWORDS and len(t) > 1]
+    # ── 1. LOAD DATA ─────────────────────────────────────────────
+    print("📥 Loading legal data…")
+    if not os.path.exists(DATA_DIR):
+        raise FileNotFoundError(f"Data folder not found: {DATA_DIR}")
 
-    # 1. Load JSONs from ./data — propagate law_name to every article
-    def load_json_folder(folder_path: str):
-        all_items = []
-        for filename in os.listdir(folder_path):
+    def _load_json_folder(folder_path: str) -> List[dict]:
+        """Load all JSON files from *folder_path*, propagating law_name to every article."""
+        all_items: List[dict] = []
+        for filename in sorted(os.listdir(folder_path)):
             if not filename.lower().endswith(".json"):
                 continue
-            file_path = os.path.join(folder_path, filename)
-            with open(file_path, "r", encoding="utf-8") as f:
+            fpath = os.path.join(folder_path, filename)
+            with open(fpath, "r", encoding="utf-8") as f:
                 obj = json.load(f)
 
-            wrapper_law_name = ""  # law_name from the wrapper object
-
+            wrapper_law_name = ""
             if isinstance(obj, list):
-                # Could be [wrapper_dict_with_data] or [flat_articles]
-                articles = []
+                articles: List[dict] = []
                 for entry in obj:
                     if isinstance(entry, dict) and "data" in entry and isinstance(entry["data"], list):
                         wrapper_law_name = entry.get("law_name", "")
@@ -194,68 +304,53 @@ def _initialize_rag_pipeline_impl():
                             art.setdefault("_law_name", wrapper_law_name)
                         articles.extend(entry["articles"])
                     elif isinstance(entry, dict):
-                        # Flat article — guess law_name from article_id prefix
                         if not entry.get("_law_name"):
                             aid = entry.get("article_id", "")
-                            if "CONST" in aid.upper():
-                                entry["_law_name"] = "الدستور المصري"
-                            else:
-                                entry["_law_name"] = ""
+                            entry["_law_name"] = "الدستور المصري" if "CONST" in aid.upper() else ""
                         articles.append(entry)
                 all_items.extend(articles)
             elif isinstance(obj, dict):
                 wrapper_law_name = obj.get("law_name", "")
-                if "data" in obj and isinstance(obj["data"], list):
-                    for art in obj["data"]:
+                data_key = "data" if "data" in obj else ("articles" if "articles" in obj else None)
+                if data_key:
+                    for art in obj[data_key]:
                         art.setdefault("_law_name", wrapper_law_name)
-                    all_items.extend(obj["data"])
-                elif "articles" in obj and isinstance(obj["articles"], list):
-                    for art in obj["articles"]:
-                        art.setdefault("_law_name", wrapper_law_name)
-                    all_items.extend(obj["articles"])
+                    all_items.extend(obj[data_key])
                 else:
                     obj.setdefault("_law_name", wrapper_law_name)
                     all_items.append(obj)
-            else:
-                logger.warning(f"Unsupported JSON format in: {file_path}")
         return all_items
 
-    if not os.path.exists(DATA_DIR):
-        raise FileNotFoundError(f"Data folder not found: {DATA_DIR}")
+    raw_data = _load_json_folder(DATA_DIR)
 
-    data = load_json_folder(DATA_DIR)
-
-    # De-duplicate (article_id preferred, fallback to article_number)
-    unique = {}
-    for item in data:
+    # De-duplicate by article_id
+    unique: Dict[str, dict] = {}
+    for item in raw_data:
         key = str(item.get("article_id") or item.get("article_number") or hash(json.dumps(item, ensure_ascii=False)))
         unique[key] = item
     data = list(unique.values())
 
-    docs = []
+    # Build Document objects
+    docs: List[Document] = []
     for item in data:
         article_number = item.get("article_number")
         original_text = item.get("original_text")
         simplified_summary = item.get("simplified_summary")
-
         if not article_number or not original_text or not simplified_summary:
-            logger.warning("Skipping item with missing fields (article_number/original_text/simplified_summary)")
             continue
 
-        # Resolve law_name: per-article "law_name" > propagated "_law_name"
         law_name = item.get("law_name") or item.get("_law_name", "")
         part_bab = item.get("part (Bab)", "")
         chapter_fasl = item.get("chapter (Fasl)", "")
-        section = item.get("section", "")
 
-        # Construct content — includes law_name for embedding quality
-        page_content = f"""القانون: {law_name}
-رقم المادة: {article_number}
-الباب: {part_bab}
-الفصل: {chapter_fasl}
-النص الأصلي: {original_text}
-الشرح المبسط: {simplified_summary}"""
-
+        page_content = (
+            f"القانون: {law_name}\n"
+            f"رقم المادة: {article_number}\n"
+            f"الباب: {part_bab}\n"
+            f"الفصل: {chapter_fasl}\n"
+            f"النص الأصلي: {original_text}\n"
+            f"الشرح المبسط: {simplified_summary}"
+        )
         metadata = {
             "article_id": item.get("article_id") or str(article_number),
             "article_number": str(article_number),
@@ -269,338 +364,228 @@ def _initialize_rag_pipeline_impl():
 
     print(f"✅ Loaded {len(docs)} legal articles")
 
-    # 2. Embeddings
-    print("Loading embeddings model...")
-    embeddings = HuggingFaceEmbeddings(
-        model_name="Omartificial-Intelligence-Space/GATE-AraBert-v1"
-    )
-    print("✅ Embeddings model ready")
+    # ── 2. EMBEDDINGS ────────────────────────────────────────────
+    print(f"📐 Loading embedding model: {EMBEDDING_MODEL}")
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+    print("✅ Embeddings ready")
 
-    # 3. No splitting — keep articles as complete units
-    chunks = docs
-
-    # 4. Vector Store — persist once, reuse on subsequent runs (embeddings are saved)
+    # ── 3. VECTOR STORE (ChromaDB) ───────────────────────────────
     db_exists = os.path.exists(CHROMA_DIR) and os.listdir(CHROMA_DIR)
     if db_exists:
-        print("📦 Loading saved vector database (no re-embedding)...")
-        vectorstore = Chroma(
-            persist_directory=CHROMA_DIR,
-            embedding_function=embeddings,
-        )
-        # Verify the DB has roughly the same number of docs
+        print("📦 Loading persisted Chroma DB…")
+        vectorstore = Chroma(persist_directory=CHROMA_DIR, embedding_function=embeddings)
         stored_count = vectorstore._collection.count()
-        if stored_count == 0 or abs(stored_count - len(chunks)) > 5:
-            print(f"⚠️  DB doc count ({stored_count}) differs from data ({len(chunks)}). Rebuilding...")
+        if stored_count == 0 or abs(stored_count - len(docs)) > 5:
+            print(f"⚠️  Count mismatch (stored={stored_count}, data={len(docs)}). Rebuilding…")
             import shutil
             shutil.rmtree(CHROMA_DIR, ignore_errors=True)
             db_exists = False
         else:
-            print(f"✅ Loaded Chroma DB ({stored_count} vectors) — embeddings reused from disk")
+            print(f"✅ Chroma DB loaded ({stored_count} vectors)")
 
     if not db_exists:
-        print("🧱 Building vector database for the first time (creating embeddings)...")
-        vectorstore = Chroma.from_documents(
-            chunks,
-            embeddings,
-            persist_directory=CHROMA_DIR,
-        )
-        print(f"✅ Built & persisted Chroma DB ({len(chunks)} vectors)")
+        print("🧱 Building Chroma DB (first time for this embedding)…")
+        vectorstore = Chroma.from_documents(docs, embeddings, persist_directory=CHROMA_DIR)
+        print(f"✅ Chroma DB built ({len(docs)} vectors)")
 
-    base_retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
-    # 5. Create BM25 Keyword Retriever (with proper Arabic tokenization)
+    base_retriever = vectorstore.as_retriever(search_kwargs={"k": SEMANTIC_K})
+
+    # ── 4. BM25 KEYWORD RETRIEVER ────────────────────────────────
     class BM25Retriever(BaseRetriever):
-        """BM25-based keyword retriever with Arabic-aware tokenization"""
+        """BM25-based keyword retriever with Arabic-aware tokenisation."""
         corpus_docs: List[Document]
-        bm25: BM25Okapi = None
-        tokenized_corpus: list = None
-        k: int = 10
+        bm25: Optional[BM25Okapi] = None
+        tokenized_corpus: Optional[list] = None
+        k: int = BM25_K
 
         class Config:
             arbitrary_types_allowed = True
 
-        def __init__(self, **data):
-            super().__init__(**data)
-            self.tokenized_corpus = [arabic_tokenize(doc.page_content) for doc in self.corpus_docs]
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.tokenized_corpus = [arabic_tokenize(d.page_content) for d in self.corpus_docs]
             self.bm25 = BM25Okapi(self.tokenized_corpus)
 
-        def _get_relevant_documents(
-            self, query: str, *, run_manager: CallbackManagerForRetrieverRun = None
-        ) -> List[Document]:
-            tokenized_query = arabic_tokenize(query)
-            if not tokenized_query:
+        def _get_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
+            tokens = arabic_tokenize(query)
+            if not tokens:
                 return []
-            scores = self.bm25.get_scores(tokenized_query)
-            top_indices = np.argsort(scores)[::-1][:self.k]
-            return [self.corpus_docs[i] for i in top_indices if scores[i] > 0]
+            scores = self.bm25.get_scores(tokens)
+            top_idx = np.argsort(scores)[::-1][: self.k]
+            return [self.corpus_docs[i] for i in top_idx if scores[i] > 0]
 
-        async def _aget_relevant_documents(
-            self, query: str, *, run_manager: CallbackManagerForRetrieverRun = None
-        ) -> List[Document]:
+        async def _aget_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
             return self._get_relevant_documents(query, run_manager=run_manager)
 
-    bm25_retriever = BM25Retriever(corpus_docs=docs, k=10)
-    print("✅ BM25 keyword retriever ready (Arabic tokenizer)")
+    bm25_retriever = BM25Retriever(corpus_docs=docs, k=BM25_K)
+    print("✅ BM25 retriever ready (Arabic tokeniser)")
 
-    # 6. Create Metadata Filter Retriever (pre-built inverted index for speed)
+    # ── 5. METADATA FILTER RETRIEVER (inverted index) ────────────
     class MetadataFilterRetriever(BaseRetriever):
         """Fast metadata retriever using a pre-built inverted index."""
         corpus_docs: List[Document]
-        keyword_index: Dict[str, Set[int]] = None   # token → set of doc indices
-        law_name_index: Dict[str, Set[int]] = None
-        k: int = 10
+        keyword_index: Optional[Dict[str, Set[int]]] = None
+        law_name_index: Optional[Dict[str, Set[int]]] = None
+        k: int = METADATA_K
 
         class Config:
             arbitrary_types_allowed = True
 
-        def __init__(self, **data):
-            super().__init__(**data)
-            # Build inverted indices at init time (once)
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
             self.keyword_index = defaultdict(set)
             self.law_name_index = defaultdict(set)
             for idx, doc in enumerate(self.corpus_docs):
-                # Index keyword tokens
-                kw_text = doc.metadata.get('keywords', '') + ' ' + doc.metadata.get('legal_nature', '')
-                kw_text += ' ' + doc.metadata.get('part', '') + ' ' + doc.metadata.get('chapter', '')
-                for token in arabic_tokenize(kw_text):
-                    self.keyword_index[token].add(idx)
-                # Index law_name tokens
-                for token in arabic_tokenize(doc.metadata.get('law_name', '')):
-                    self.law_name_index[token].add(idx)
+                kw_text = " ".join([
+                    doc.metadata.get("keywords", ""),
+                    doc.metadata.get("legal_nature", ""),
+                    doc.metadata.get("part", ""),
+                    doc.metadata.get("chapter", ""),
+                ])
+                for tok in arabic_tokenize(kw_text):
+                    self.keyword_index[tok].add(idx)
+                for tok in arabic_tokenize(doc.metadata.get("law_name", "")):
+                    self.law_name_index[tok].add(idx)
 
-        def _get_relevant_documents(
-            self, query: str, *, run_manager: CallbackManagerForRetrieverRun = None
-        ) -> List[Document]:
-            query_tokens = arabic_tokenize(query)
-            if not query_tokens:
+        def _get_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
+            tokens = arabic_tokenize(query)
+            if not tokens:
                 return []
-
-            scores = defaultdict(float)
-            for token in query_tokens:
-                # Keyword / legal_nature / part / chapter match  (high weight)
-                for idx in self.keyword_index.get(token, set()):
+            scores: Dict[int, float] = defaultdict(float)
+            for tok in tokens:
+                for idx in self.keyword_index.get(tok, set()):
                     scores[idx] += 3.0
-                # Law-name match (helps route to correct law)
-                for idx in self.law_name_index.get(token, set()):
+                for idx in self.law_name_index.get(tok, set()):
                     scores[idx] += 4.0
-
             if not scores:
                 return []
-
-            top = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:self.k]
+            top = sorted(scores.items(), key=lambda x: x[1], reverse=True)[: self.k]
             return [self.corpus_docs[idx] for idx, _ in top]
 
-        async def _aget_relevant_documents(
-            self, query: str, *, run_manager: CallbackManagerForRetrieverRun = None
-        ) -> List[Document]:
+        async def _aget_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
             return self._get_relevant_documents(query, run_manager=run_manager)
 
-    metadata_retriever = MetadataFilterRetriever(corpus_docs=docs, k=10)
-    print("✅ Metadata filter retriever ready (inverted index)")
+    metadata_retriever = MetadataFilterRetriever(corpus_docs=docs, k=METADATA_K)
+    print("✅ Metadata retriever ready (inverted index)")
 
-    # 7. Create Hybrid RRF Retriever (parallel execution)
+    # ── 6. HYBRID RRF RETRIEVER (parallel) ───────────────────────
     class HybridRRFRetriever(BaseRetriever):
-        """Combines semantic, BM25, and metadata retrievers using Reciprocal Rank Fusion.
-        All three sub-retrievers run **in parallel** via ThreadPoolExecutor."""
+        """Reciprocal Rank Fusion over semantic + BM25 + metadata retrievers.
+        All sub-retrievers run in parallel via ThreadPoolExecutor."""
         semantic_retriever: BaseRetriever
         bm25_retriever: BM25Retriever
         metadata_retriever: MetadataFilterRetriever
-        beta_semantic: float = 0.6
-        beta_keyword: float = 0.2
-        beta_metadata: float = 0.2
-        k: int = 60   # RRF constant
-        top_k: int = 12
+        beta_semantic: float = BETA_SEMANTIC
+        beta_keyword: float = BETA_BM25
+        beta_metadata: float = BETA_METADATA
+        k: int = RRF_K
+        top_k: int = RRF_TOP_K
 
         class Config:
             arbitrary_types_allowed = True
 
-        def _get_relevant_documents(
-            self, query: str, *, run_manager: CallbackManagerForRetrieverRun = None
-        ) -> List[Document]:
-            # --- Run all three retrievers in parallel ---
+        def _get_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
             with ThreadPoolExecutor(max_workers=3) as pool:
-                fut_semantic = pool.submit(self.semantic_retriever.invoke, query)
-                fut_bm25     = pool.submit(self.bm25_retriever.invoke, query)
-                fut_meta     = pool.submit(self.metadata_retriever.invoke, query)
+                f_sem = pool.submit(self.semantic_retriever.invoke, query)
+                f_bm25 = pool.submit(self.bm25_retriever.invoke, query)
+                f_meta = pool.submit(self.metadata_retriever.invoke, query)
+                semantic_docs = f_sem.result()
+                bm25_docs = f_bm25.result()
+                meta_docs = f_meta.result()
 
-                semantic_docs = fut_semantic.result()
-                bm25_docs     = fut_bm25.result()
-                metadata_docs = fut_meta.result()
-
-            # --- Reciprocal Rank Fusion ---
             rrf_scores: Dict[str, float] = {}
             all_docs: Dict[str, Document] = {}
-
             for weight, doc_list in [
                 (self.beta_semantic, semantic_docs),
-                (self.beta_keyword,  bm25_docs),
-                (self.beta_metadata, metadata_docs),
+                (self.beta_keyword, bm25_docs),
+                (self.beta_metadata, meta_docs),
             ]:
                 for rank, doc in enumerate(doc_list, start=1):
-                    doc_id = doc.metadata.get('article_id') or doc.metadata.get('article_number') or str(hash(doc.page_content))
-                    rrf_scores[doc_id] = rrf_scores.get(doc_id, 0.0) + weight / (self.k + rank)
-                    if doc_id not in all_docs:
-                        all_docs[doc_id] = doc
+                    did = doc.metadata.get("article_id") or doc.metadata.get("article_number") or str(hash(doc.page_content))
+                    rrf_scores[did] = rrf_scores.get(did, 0.0) + weight / (self.k + rank)
+                    all_docs.setdefault(did, doc)
 
             sorted_ids = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
-            return [all_docs[did] for did, _ in sorted_ids[:self.top_k] if did in all_docs]
+            return [all_docs[did] for did, _ in sorted_ids[: self.top_k] if did in all_docs]
 
-        async def _aget_relevant_documents(
-            self, query: str, *, run_manager: CallbackManagerForRetrieverRun = None
-        ) -> List[Document]:
+        async def _aget_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
             return self._get_relevant_documents(query, run_manager=run_manager)
 
     hybrid_retriever = HybridRRFRetriever(
         semantic_retriever=base_retriever,
         bm25_retriever=bm25_retriever,
         metadata_retriever=metadata_retriever,
-        beta_semantic=0.5,
-        beta_keyword=0.3,
-        beta_metadata=0.2,
-        k=60,
-        top_k=12,
+        beta_semantic=BETA_SEMANTIC,
+        beta_keyword=BETA_BM25,
+        beta_metadata=BETA_METADATA,
+        k=RRF_K,
+        top_k=RRF_TOP_K,
     )
-    print("✅ Hybrid RRF retriever ready (parallel, β: sem=0.5, bm25=0.3, meta=0.2)")
+    print(f"✅ Hybrid RRF retriever (β: sem={BETA_SEMANTIC}, bm25={BETA_BM25}, meta={BETA_METADATA})")
 
+    # ── 7. RERANKER ──────────────────────────────────────────────
+    print("🔃 Loading reranker…")
+    if not os.path.exists(RERANKER_DIR):
+        raise FileNotFoundError(f"Reranker not found: {RERANKER_DIR}")
 
-
-    # 9. Reranker
-    print("Loading reranker model...")
-    local_model_path = r"D:\FOE\Senior 2\Graduation Project\Chatbot_me\reranker"
-    
-    if not os.path.exists(local_model_path):
-        raise FileNotFoundError(f"Reranker path not found: {local_model_path}")
-
-    model = HuggingFaceCrossEncoder(model_name=local_model_path)
-    compressor = CrossEncoderReranker(model=model, top_n=5)
-
+    cross_encoder = HuggingFaceCrossEncoder(model_name=RERANKER_DIR)
+    compressor = CrossEncoderReranker(model=cross_encoder, top_n=RERANKER_TOP_N)
     compression_retriever = ContextualCompressionRetriever(
         base_compressor=compressor,
-        base_retriever=hybrid_retriever
+        base_retriever=hybrid_retriever,
     )
-    print("✅ Reranker model ready")
+    print(f"✅ Reranker ready (top_n={RERANKER_TOP_N})")
 
-    # 7. LLM Configuration — tuned for legal accuracy with practical flexibility
+    # ── 8. LLM ───────────────────────────────────────────────────
     llm = ChatGroq(
         groq_api_key=os.getenv("GROQ_API_KEY"),
-        model_name="llama-3.3-70b-versatile",  # Best Arabic comprehension on Groq
-        temperature=0.2,       # Low for legal precision; >0 allows natural phrasing
-        max_tokens=2048,       # Ensure complete legal answers are never truncated
-        model_kwargs={
-            "top_p": 0.85,     # Focused sampling — avoids hallucinated legal claims
-        }
+        model_name=LLM_MODEL,
+        temperature=LLM_TEMPERATURE,
+        model_kwargs={"top_p": LLM_TOP_P},
+        max_retries=LLM_MAX_RETRIES,
+        request_timeout=LLM_TIMEOUT,
     )
 
-# ==================================================
-    # 🛠️ THE FIX: SEPARATE SYSTEM INSTRUCTIONS FROM USER INPUT
-    # ==================================================
-    
-# ==================================================
-    # 🧠 PROMPT ENGINEERING: DECISION TREE LOGIC
-    # ==================================================
-    
-    system_instructions = """
-<role>
-أنت "المساعد القانوني الذكي"، مستشار قانوني متخصص في القوانين المصرية التالية:
-- الدستور المصري
-- القانون المدني المصري
-- قانون العمل المصري
-- قانون الأحوال الشخصية المصري
-- قانون مكافحة جرائم تقنية المعلومات
-- قانون الإجراءات الجنائية المصري
-
-مهمتك الأساسية: الإجابة بدقة استناداً إلى "السياق التشريعي" المرفق أدناه.
-عند وجود نص قانوني في السياق، هو مصدرك الأول والأهم.
-</role>
-
-<decision_logic>
-حلّل سؤال المستخدم ثم اتبع أول حالة ينطبق شرطها:
-
-━━━ الحالة ١ — الإجابة موجودة في السياق (الأولوية القصوى) ━━━
-الشرط: توجد مادة أو أكثر في السياق تتناول موضوع السؤال بشكل مباشر أو وثيق الصلة.
-الفعل:
-• أجب من السياق مباشرةً دون مقدمات.
-• وثّق كل معلومة بذكر اسم القانون ورقم المادة (مثال: «وفقاً للمادة (٥٢) من قانون العمل...»).
-• استخرج ما يجيب السؤال تحديداً — لا تنسخ المادة كاملة.
-• لا تضف معلومات من خارج السياق في هذه الحالة.
-
-━━━ الحالة ٢ — السياق يغطي الموضوع جزئياً ━━━
-الشرط: توجد مواد ذات صلة لكنها لا تجيب السؤال بالكامل.
-الفعل:
-• اذكر أولاً ما تنص عليه المواد المتاحة (مع التوثيق).
-• ثم أضف توضيحاً عملياً مختصراً يساعد المستخدم، مع التنبيه بعبارة:
-  «ملاحظة عملية:» أو «من الناحية التطبيقية:» قبل أي إضافة.
-• لا تخترع أرقام مواد أو تنسب نصوصاً لقوانين لم ترد في السياق.
-
-━━━ الحالة ٣ — السياق لا يحتوي الإجابة + السؤال إجرائي/عملي ━━━
-الشرط: لا توجد مادة في السياق تتعلق بالموضوع، لكن السؤال عن إجراءات عملية (بلاغ، محضر، حادث، طلاق، تعامل مع الشرطة...).
-الفعل:
-• ابدأ بعبارة: «بناءً على الإجراءات القانونية المتعارف عليها في مصر (وليس استناداً لنص قانوني محدد من قاعدة البيانات):»
-• قدم خطوات عملية مرقمة ومختصرة.
-• لا تذكر أرقام مواد — لا تخترع مراجع.
-• أنهِ بـ«يُنصح بمراجعة محامٍ متخصص لتأكيد الإجراءات.»
-
-━━━ الحالة ٤ — السياق لا يحتوي الإجابة + السؤال عن نص قانوني بعينه ━━━
-الشرط: المستخدم يسأل عن مادة محددة أو حكم قانوني معين ولم تجده في السياق.
-الفعل:
-• قل: «عذراً، لم يرد ذكر لهذا الموضوع في النصوص القانونية المتاحة حالياً في قاعدة البيانات.»
-• لا تجب من ذاكرتك لتجنب الخطأ في النصوص القانونية.
-• يمكنك اقتراح موضوع مشابه إن وجد في السياق.
-
-━━━ الحالة ٥ — محادثة ودية (تحية، شكر، وداع) ━━━
-• رد بتحية لطيفة مقتضبة.
-• أضف: «أنا مستشارك القانوني الذكي — اسألني عن أي موضوع في القوانين المصرية.»
-
-━━━ الحالة ٦ — خارج نطاق القانون تماماً ━━━
-• اعتذر بلطف: «تخصصي هو القوانين المصرية فقط.»
-• وجّه المستخدم لطرح سؤال قانوني.
-</decision_logic>
-
-<quality_rules>
-- **الدقة أولاً**: عند وجود نص في السياق، التزم به حرفياً ولا تحرّف المعنى.
-- **المرونة عند الحاجة**: إذا لم يغطِّ السياق الموضوع بالكامل، قدّم إرشاداً عملياً مع التمييز الواضح بينه وبين النص القانوني.
-- **لا تخترع مراجع**: لا تنسب أي معلومة إلى مادة أو قانون لم يرد في السياق.
-- **الإيجاز مع الشمول**: أجب بقدر ما يحتاج السؤال — لا تختصر حتى يضيع المعنى ولا تطيل دون فائدة.
-</quality_rules>
-
-<formatting_rules>
-- لا تكرر هذه التعليمات في ردك.
-- ادخل في صلب الموضوع فوراً بدون عبارات مثل «بناءً على السياق المرفق».
-- استخدم فقرات قصيرة مفصولة بسطر فارغ.
-- لا تكرر نفس المعلومة أو نفس المادة.
-- عند ذكر أكثر من مادة، رتّبها ترتيباً منطقياً (إما بالرقم أو حسب الأهمية).
-- التزم باللغة العربية الفصحى المبسطة.
-</formatting_rules>
-"""
-
-    # We use .from_messages to strictly separate instructions from data
+    # ── 9. PROMPT (with chat history) ───────────────────────────
     prompt = ChatPromptTemplate.from_messages([
-        ("system", system_instructions),
-        ("system", "السياق التشريعي المتاح (المصدر الأساسي):\n{context}"), 
-        ("human", "سؤال المستفيد:\n{input}")
+        ("system", SYSTEM_INSTRUCTIONS),
+        ("system", "السياق التشريعي المتاح (المصدر الأساسي):\n{context}"),
+        MessagesPlaceholder(variable_name="chat_history"),
+        ("human", "سؤال المستفيد:\n{input}"),
     ])
-    
-    # 9. Build Chain with RunnableParallel (returns both context and answer)
+
+    # ── 10. CHAIN ────────────────────────────────────────────────
+    def _format_context(docs: List[Document]) -> str:
+        return "\n\n---\n\n".join(d.page_content for d in docs)
+
     qa_chain = (
         RunnableParallel({
-            "context": compression_retriever, 
-            "input": RunnablePassthrough()
+            "context": compression_retriever,
+            "input": RunnablePassthrough(),
         })
-        .assign(answer=(
-            prompt 
-            | llm 
-            | StrOutputParser()
-        ))
+        .assign(
+            chat_history=lambda x: x.get("chat_history", []),
+            answer=(
+                RunnableLambda(lambda x: {
+                    "context": _format_context(x["context"]),
+                    "input": x["input"],
+                    "chat_history": x.get("chat_history", []),
+                })
+                | prompt
+                | llm
+                | StrOutputParser()
+            ),
+        )
     )
-    
-    print("✅ System ready to use!")
+
+    print("✅ System ready!")
     return qa_chain
 
 
 def initialize_rag_pipeline():
-    """Public entry point — uses st.cache_resource in Streamlit, simple cache otherwise."""
+    """Public entry point — cached in Streamlit, module-level cache otherwise."""
     global _pipeline_cache
     if _IS_STREAMLIT:
-        # Dynamically apply @st.cache_resource only inside Streamlit runtime
         @st.cache_resource
         def _cached():
             return _initialize_rag_pipeline_impl()
@@ -610,99 +595,88 @@ def initialize_rag_pipeline():
             _pipeline_cache = _initialize_rag_pipeline_impl()
         return _pipeline_cache
 
-# ==========================================
-# ⚡ MAIN EXECUTION (Streamlit app only)
-# ==========================================
+
+# ═══════════════════════════════════════════════════════════════════
+# STREAMLIT MAIN APP
+# ═══════════════════════════════════════════════════════════════════
 if _IS_STREAMLIT:
     try:
-        # Only need the chain now - it handles all retrieval internally
         qa_chain = initialize_rag_pipeline()
-        
     except Exception as e:
-        st.error(f"Critical Error loading application: {e}")
+        st.error(f"خطأ فادح في تحميل النظام: {e}")
         st.stop()
 
-    # ==========================================
-    # 💬 CHAT LOOP
-    # ==========================================
+    # ── Session state ────────────────────────────────────────────
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # Display Chat History (with Eastern Arabic numerals)
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            # Convert to Eastern Arabic when displaying from history
-            st.markdown(convert_to_eastern_arabic(message["content"]))
+    # ── Display chat history ─────────────────────────────────────
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(convert_to_eastern_arabic(msg["content"]))
 
-    # Handle New User Input
-    if prompt_input := st.chat_input("اكتب سؤالك القانوني هنا..."):
-        # Show user message
+    # ── Handle new input ─────────────────────────────────────────
+    if prompt_input := st.chat_input("اكتب سؤالك القانوني هنا…"):
         st.session_state.messages.append({"role": "user", "content": prompt_input})
         with st.chat_message("user"):
             st.markdown(prompt_input)
 
-        # Generate Response
         with st.chat_message("assistant"):
-            with st.spinner("جاري التحليل القانوني..."):
+            with st.spinner("جاري التحليل القانوني…"):
                 try:
-                    # Invoke chain ONCE - returns Dict with 'context', 'input', and 'answer'
-                    result = qa_chain.invoke(prompt_input)
-                    
-                    # Extract answer and context from result
-                    response_text = result["answer"]
-                    source_docs = result["context"]  # Context is already in the result!
+                    # Build chat history from previous messages (exclude current question)
+                    history = format_chat_history(st.session_state.messages[:-1])
 
-                    # Display Answer
-                    response_text_arabic = convert_to_eastern_arabic(response_text)
-                    st.markdown(response_text_arabic)
-                    
-                    # Display Sources
-                    if source_docs and len(source_docs) > 0:
-                        print(f"✅ Found {len(source_docs)} documents")
-                        # Deduplicate documents by article_number
-                        seen_articles = set()
-                        unique_docs = []
-                        
+                    # Invoke chain
+                    result = qa_chain.invoke(
+                        {"input": prompt_input, "chat_history": history}
+                    )
+
+                    if isinstance(result, dict):
+                        response_text = result.get("answer", "")
+                        source_docs = result.get("context", [])
+                    else:
+                        response_text = str(result)
+                        source_docs = []
+
+                    # Display answer
+                    st.markdown(convert_to_eastern_arabic(response_text))
+
+                    # Display sources
+                    if source_docs:
+                        seen: Set[str] = set()
+                        unique_docs: List[Document] = []
                         for doc in source_docs:
-                            article_num = str(doc.metadata.get('article_number', '')).strip()
-                            if article_num and article_num not in seen_articles:
-                                seen_articles.add(article_num)
+                            art_num = str(doc.metadata.get("article_number", "")).strip()
+                            if art_num and art_num not in seen:
+                                seen.add(art_num)
                                 unique_docs.append(doc)
-                        
-                        st.markdown("---")  # Separator before sources
-                        
+
+                        st.markdown("---")
                         if unique_docs:
                             with st.expander(f"📚 المصادر المستخدمة ({len(unique_docs)} مادة)"):
                                 st.markdown("### المواد القانونية المستخدمة في التحليل:")
                                 st.markdown("---")
-                                
-                                for idx, doc in enumerate(unique_docs, 1):
-                                    article_num = str(doc.metadata.get('article_number', '')).strip()
-                                    legal_nature = doc.metadata.get('legal_nature', '')
-                                    law_name = doc.metadata.get('law_name', '')
-                                    
-                                    if article_num:
-                                        header = f"**المادة رقم {convert_to_eastern_arabic(article_num)}**"
-                                        if law_name:
-                                            header += f" — {law_name}"
-                                        st.markdown(header)
-                                        if legal_nature:
-                                            st.markdown(f"*الطبيعة القانونية: {legal_nature}*")
-                                        
-                                        # Display article content
-                                        content_lines = doc.page_content.strip().split('\n')
-                                        for line in content_lines:
-                                            line = line.strip()
-                                            if line:
-                                                st.markdown(convert_to_eastern_arabic(line))
-                                        
-                                        st.markdown("---")
+                                for doc in unique_docs:
+                                    art_num = str(doc.metadata.get("article_number", "")).strip()
+                                    law = doc.metadata.get("law_name", "")
+                                    nature = doc.metadata.get("legal_nature", "")
+                                    header = f"**المادة رقم {convert_to_eastern_arabic(art_num)}**"
+                                    if law:
+                                        header += f" — {law}"
+                                    st.markdown(header)
+                                    if nature:
+                                        st.markdown(f"*الطبيعة القانونية: {nature}*")
+                                    for line in doc.page_content.strip().split("\n"):
+                                        line = line.strip()
+                                        if line:
+                                            st.markdown(convert_to_eastern_arabic(line))
+                                    st.markdown("---")
                         else:
                             st.info("📌 لم يتم العثور على مصادر")
                     else:
                         st.info("📌 لم يتم العثور على مصادر")
-                    
-                    # Persist the raw answer to avoid double conversion glitches on rerun
+
                     st.session_state.messages.append({"role": "assistant", "content": response_text})
                 except Exception as e:
                     st.error(f"حدث خطأ: {e}")

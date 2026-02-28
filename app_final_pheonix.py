@@ -1,9 +1,39 @@
-# === Phoenix Observability Setup ===
+# -*- coding: utf-8 -*-
+"""
+Egyptian Legal AI Assistant — Multi-Law RAG Pipeline + Phoenix Observability
+=============================================================================
+Same architecture as app_final_updated.py with OpenTelemetry tracing for
+Arize Phoenix. Traces are exported to a local Phoenix server (OTLP).
+
+Run Phoenix first:  python -m phoenix.server.main serve
+Then run this app:  streamlit run app_final_pheonix.py
+Phoenix UI:         http://localhost:6006
+"""
+
 import os
+import sys
+import json
+import re
+import time
 from datetime import datetime
+from dotenv import load_dotenv
+import logging
+import warnings
+from concurrent.futures import ThreadPoolExecutor
+from collections import defaultdict
+from typing import List, Dict, Set, Tuple, Optional
+
+# Suppress progress bars and noisy logs
+os.environ["TRANSFORMERS_NO_PROGRESS_BAR"] = "1"
+warnings.filterwarnings("ignore")
+
+# ═══════════════════════════════════════════════════════════════════
+# PHOENIX / OPENTELEMETRY TRACING SETUP
+# ═══════════════════════════════════════════════════════════════════
+PHOENIX_AVAILABLE = False
+_phoenix_tracer = None
 
 try:
-    # OpenTelemetry SDK + OTLP exporter (Phoenix consumes OTLP)
     from opentelemetry import trace
     from opentelemetry.sdk.resources import SERVICE_NAME, Resource
     from opentelemetry.sdk.trace import TracerProvider
@@ -11,59 +41,45 @@ try:
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
     PHOENIX_AVAILABLE = True
 except Exception:
-    PHOENIX_AVAILABLE = False
+    pass
 
 
 def setup_phoenix_tracing():
-    """Configure OTLP tracing for Phoenix. Uses PHOENIX_OTLP_ENDPOINT env if set."""
+    """Configure OTLP tracing for Phoenix."""
     if not PHOENIX_AVAILABLE:
+        print("⚠️  Phoenix tracing unavailable (missing opentelemetry packages)")
         return None
-
-    service_name = os.getenv("PHOENIX_SERVICE_NAME", "constitutional-assistant")
-    otlp_endpoint = os.getenv("PHOENIX_OTLP_ENDPOINT", "http://localhost:6006/v1/traces")
-
+    service_name = os.getenv("PHOENIX_SERVICE_NAME", "legal-assistant")
+    endpoint = os.getenv("PHOENIX_OTLP_ENDPOINT", "http://localhost:6006/v1/traces")
     resource = Resource(attributes={SERVICE_NAME: service_name})
     provider = TracerProvider(resource=resource)
-    exporter = OTLPSpanExporter(endpoint=otlp_endpoint)
-    span_processor = BatchSpanProcessor(exporter)
-    provider.add_span_processor(span_processor)
+    exporter = OTLPSpanExporter(endpoint=endpoint)
+    provider.add_span_processor(BatchSpanProcessor(exporter))
     trace.set_tracer_provider(provider)
+    print(f"✅ Phoenix tracing enabled → {endpoint}")
     return trace.get_tracer(service_name)
 
 
-# Create a module-level tracer
 _phoenix_tracer = setup_phoenix_tracing()
 
 
 class PhoenixSpan:
-    """Context manager helper to create spans with proper parent-child hierarchy."""
+    """Context manager for creating OpenTelemetry spans with proper hierarchy."""
+
     def __init__(self, name: str, attributes: dict | None = None, kind: str = "INTERNAL"):
         self.name = name
         self.attributes = attributes or {}
         self.kind = kind
         self._span_context = None
         self._span = None
-        self._start_time = None
+        self._t0 = None
 
     def __enter__(self):
         if _phoenix_tracer:
             from opentelemetry.trace import SpanKind
-            import time
-            self._start_time = time.time()
-            
-            # Map string kind to SpanKind enum
-            kind_map = {
-                "CLIENT": SpanKind.CLIENT,
-                "SERVER": SpanKind.SERVER,
-                "INTERNAL": SpanKind.INTERNAL,
-            }
-            span_kind = kind_map.get(self.kind, SpanKind.INTERNAL)
-            
-            # Use start_as_current_span to establish parent-child relationships
-            self._span_context = _phoenix_tracer.start_as_current_span(
-                self.name,
-                kind=span_kind
-            )
+            self._t0 = time.time()
+            kind_map = {"CLIENT": SpanKind.CLIENT, "SERVER": SpanKind.SERVER, "INTERNAL": SpanKind.INTERNAL}
+            self._span_context = _phoenix_tracer.start_as_current_span(self.name, kind=kind_map.get(self.kind, SpanKind.INTERNAL))
             self._span = self._span_context.__enter__()
             for k, v in self.attributes.items():
                 try:
@@ -87,752 +103,588 @@ class PhoenixSpan:
                     from opentelemetry.trace import Status, StatusCode
                     self._span.set_status(Status(StatusCode.ERROR, str(exc)))
                 else:
-                    # Add duration as attribute
-                    if self._start_time:
-                        import time
-                        duration = time.time() - self._start_time
-                        self._span.set_attribute("duration_ms", round(duration * 1000, 2))
+                    if self._t0:
+                        self._span.set_attribute("duration_ms", round((time.time() - self._t0) * 1000, 2))
                     from opentelemetry.trace import Status, StatusCode
                     self._span.set_status(Status(StatusCode.OK))
                 self._span_context.__exit__(exc_type, exc, tb)
             except Exception:
                 pass
 
-# -*- coding: utf-8 -*-
-import os
-import sys
-import json
-from dotenv import load_dotenv
-import streamlit as st
-import logging
-import warnings
 
-# Suppress progress bars from transformers/tqdm
-os.environ['TRANSFORMERS_NO_PROGRESS_BAR'] = '1'
-warnings.filterwarnings('ignore')
-
-# 1. Loaders & Splitters
+# ═══════════════════════════════════════════════════════════════════
+# LANGCHAIN & ML IMPORTS
+# ═══════════════════════════════════════════════════════════════════
 from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.retrievers import BaseRetriever
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
-from typing import List
-from rank_bm25 import BM25Okapi
-import numpy as np
-
-# 2. Vector Store & Embeddings
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough, RunnableParallel, RunnableLambda
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
-
-# 3. Reranker Imports
 from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
 from langchain_classic.retrievers import ContextualCompressionRetriever
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
-
-# 4. LLM
 from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough, RunnableParallel
+from rank_bm25 import BM25Okapi
+import numpy as np
+import streamlit as st
 
-# Configure logging
+# ═══════════════════════════════════════════════════════════════════
+# CONFIGURATION (identical to app_final_updated.py)
+# ═══════════════════════════════════════════════════════════════════
+EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "Omartificial-Intelligence-Space/GATE-AraBert-v1")
+
+SEMANTIC_K: int = 10
+BM25_K: int = 10
+METADATA_K: int = 10
+RRF_K: int = 60
+RRF_TOP_K: int = 12
+BETA_SEMANTIC: float = 0.50
+BETA_BM25: float = 0.30
+BETA_METADATA: float = 0.20
+RERANKER_TOP_N: int = 5
+
+LLM_MODEL: str = "llama-3.3-70b-versatile"
+LLM_TEMPERATURE: float = 0.2
+LLM_TOP_P: float = 0.80
+LLM_MAX_RETRIES: int = 3
+LLM_TIMEOUT: int = 120
+CHAT_HISTORY_TURNS: int = 3
+
+# ═══════════════════════════════════════════════════════════════════
+# LOGGING & PATHS
+# ═══════════════════════════════════════════════════════════════════
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 load_dotenv()
 
-# ==========================================
-# 🎨 UI SETUP (CSS FOR ARABIC & RTL)
-# ==========================================
-st.set_page_config(page_title="المساعد القانوني", page_icon="⚖️")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+RERANKER_DIR = os.path.join(BASE_DIR, "reranker")
+_model_tag = EMBEDDING_MODEL.split("/")[-1].lower().replace("-", "_")
+CHROMA_DIR = os.path.join(BASE_DIR, f"chroma_db_{_model_tag}")
 
-# This CSS block fixes the "001" number issue and right alignment
+# ═══════════════════════════════════════════════════════════════════
+# STREAMLIT UI
+# ═══════════════════════════════════════════════════════════════════
+st.set_page_config(page_title="المساعد القانوني", page_icon="⚖️")
 st.markdown("""
 <style>
-    /* Force the main app container to be Right-to-Left */
-    .stApp {
-        direction: rtl;
-        text-align: right;
-    }
-    
-    /* Fix input fields to type from right */
-    .stTextInput input {
-        direction: rtl;
-        text-align: right;
-    }
-
-    /* Fix chat messages alignment */
-    .stChatMessage {
-        direction: rtl;
-        text-align: right;
-    }
-    
-    /* Ensure proper paragraph spacing */
-    .stMarkdown p {
-        margin: 0.5em 0 !important;
-        line-height: 1.6;
-        word-spacing: 0.1em;
-    }
-    
-    /* Ensure numbers display correctly in RTL */
-    p, div, span, label {
-        unicode-bidi: embed;
-        direction: inherit;
-        white-space: normal;
-        word-wrap: break-word;
-    }
-    
-    /* Force all content to respect RTL */
-    * {
-        direction: rtl !important;
-    }
-    
-    /* Preserve line breaks and spacing */
-    .stMarkdown pre {
-        direction: rtl;
-        text-align: right;
-        white-space: pre-wrap;
-        word-wrap: break-word;
-    }
-    
-    /* Hide the "Deploy" button and standard menu for cleaner look */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    
+    .stApp { direction: rtl; text-align: right; }
+    .stTextInput input { direction: rtl; text-align: right; }
+    .stChatMessage { direction: rtl; text-align: right; }
+    .stMarkdown p { margin: 0.5em 0 !important; line-height: 1.6; word-spacing: 0.1em; }
+    p, div, span, label { unicode-bidi: embed; direction: inherit; white-space: normal; word-wrap: break-word; }
+    * { direction: rtl !important; }
+    .stMarkdown pre { direction: rtl; text-align: right; white-space: pre-wrap; word-wrap: break-word; }
+    #MainMenu { visibility: hidden; }
+    footer { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
+st.title("⚖️ المساعد القانوني الذكي (مع Phoenix)")
 
-# Put this at the top of your code
-def convert_to_eastern_arabic(text):
-    """Converts 0123456789 to ٠١٢٣٤٥٦٧٨٩"""
+# ═══════════════════════════════════════════════════════════════════
+# UTILITY HELPERS (same as app_final_updated.py)
+# ═══════════════════════════════════════════════════════════════════
+
+def convert_to_eastern_arabic(text: str) -> str:
     if not isinstance(text, str):
-        return text 
-    western_numerals = '0123456789'
-    eastern_numerals = '٠١٢٣٤٥٦٧٨٩'
-    translation_table = str.maketrans(western_numerals, eastern_numerals)
-    return text.translate(translation_table)
+        return text
+    return text.translate(str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩"))
 
-st.title("⚖️ المساعد القانوني الذكي (دستور مصر)")
 
-# ==========================================
-# 🚀 CACHED RESOURCE LOADING (THE FIX)
-# ==========================================
-# This decorator tells Streamlit: "Run this ONCE and save the result."
+_ARABIC_STOPWORDS: Set[str] = {
+    "في", "من", "على", "إلى", "عن", "أن", "هذا", "هذه", "التي", "الذي",
+    "ما", "لا", "أو", "و", "كل", "ذلك", "بين", "كان", "قد", "هو", "هي",
+    "لم", "بل", "ثم", "إذا", "حتى", "لكن", "منه", "فيه", "عند", "له",
+    "بها", "لها", "منها", "فيها", "التى", "الذى", "ولا", "وفى", "كما",
+    "تلك", "هنا", "أي", "دون", "ليس", "إلا", "أما", "مع", "عليه",
+}
+
+
+def arabic_tokenize(text: str) -> List[str]:
+    text = re.sub(r"[\u064B-\u065F\u0670]", "", text)
+    text = re.sub(r"[^\u0600-\u06FF\s]", " ", text)
+    tokens = text.split()
+    return [t for t in tokens if t not in _ARABIC_STOPWORDS and len(t) > 1]
+
+
+def format_chat_history(messages: list, max_turns: int = CHAT_HISTORY_TURNS) -> List:
+    pairs: List[Tuple[str, str]] = []
+    i = 0
+    while i < len(messages):
+        if messages[i].get("role") == "user":
+            user_msg = messages[i]["content"]
+            ai_msg = ""
+            if i + 1 < len(messages) and messages[i + 1].get("role") == "assistant":
+                ai_msg = messages[i + 1]["content"]
+                i += 2
+            else:
+                i += 1
+            pairs.append((user_msg, ai_msg))
+        else:
+            i += 1
+    history: List = []
+    for user_text, ai_text in pairs[-max_turns:]:
+        history.append(HumanMessage(content=user_text))
+        if ai_text:
+            history.append(AIMessage(content=ai_text))
+    return history
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PROMPT (same as app_final_updated.py)
+# ═══════════════════════════════════════════════════════════════════
+
+SYSTEM_INSTRUCTIONS: str = """\
+<role>
+أنت "المساعد القانوني الذكي"، مستشار قانوني متخصص في القوانين المصرية التالية:
+• الدستور المصري
+• القانون المدني المصري
+• قانون العمل المصري
+• قانون الأحوال الشخصية المصري
+• قانون مكافحة جرائم تقنية المعلومات
+• قانون الإجراءات الجنائية المصري
+
+مهمتك: الإجابة بدقة استناداً إلى السياق التشريعي المرفق أدناه.
+</role>
+
+<chat_history_instruction>
+إذا وُجد سجل محادثة سابق، استخدمه لفهم أسئلة المتابعة والسياق.
+لكن دائماً أعطِ الأولوية للسياق التشريعي المسترجع عند الإجابة.
+لا تكرر إجابات سابقة بالكامل — أشر إليها باختصار إن لزم.
+</chat_history_instruction>
+
+<decision_logic>
+حلّل سؤال المستخدم ثم اتبع أول حالة ينطبق شرطها:
+
+━━━ الحالة ١ — الإجابة موجودة في السياق ━━━
+• أجب من السياق مباشرةً.
+• وثّق بذكر اسم القانون ورقم المادة.
+• لا تُضف معلومات من خارج السياق.
+
+━━━ الحالة ٢ — السياق يغطي الموضوع جزئياً ━━━
+• اذكر ما تنص عليه المواد المتاحة (مع التوثيق).
+• أضف «ملاحظة عملية:» قبل أي إضافة خارجية.
+
+━━━ الحالة ٣ — لا يوجد سياق + سؤال إجرائي ━━━
+• ابدأ بـ: «بناءً على الإجراءات القانونية المتعارف عليها في مصر:»
+• خطوات مرقمة بدون أرقام مواد.
+• أنهِ بـ «يُنصح بمراجعة محامٍ متخصص.»
+
+━━━ الحالة ٤ — لا يوجد سياق + نص قانوني ━━━
+• «عذراً، لم يرد ذكر لهذا الموضوع في النصوص المتاحة حالياً.»
+
+━━━ الحالة ٥ — محادثة ودية ━━━
+• رد بتحية + «أنا مستشارك القانوني الذكي — اسألني عن أي موضوع في القوانين المصرية.»
+
+━━━ الحالة ٦ — خارج نطاق القانون ━━━
+• «تخصصي هو القوانين المصرية فقط.»
+</decision_logic>
+
+<quality_rules>
+• الدقة أولاً. لا تخترع مراجع. إيجاز مع شمول. نقاط مرقمة عند الحاجة.
+</quality_rules>
+
+<formatting_rules>
+• ادخل في صلب الموضوع. فقرات قصيرة. لا تكرار. عربية فصحى مبسطة.
+</formatting_rules>
+"""
+
+# ═══════════════════════════════════════════════════════════════════
+# RAG PIPELINE (with Phoenix spans)
+# ═══════════════════════════════════════════════════════════════════
+
 @st.cache_resource
 def initialize_rag_pipeline():
-    print("🔄 Initializing system...")
-    print("📥 Loading data...")
-    
-    # 1. Load JSON
-    json_path = "Egyptian_Constitution_legalnature_only.json"
-    if not os.path.exists(json_path):
-        raise FileNotFoundError(f"File not found: {json_path}")
-        
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    print("🔄 Initialising system…")
 
-    # Create a mapping of article numbers for cross-reference lookup
-    article_map = {str(item['article_number']): item for item in data}
+    # ── 1. LOAD DATA ─────────────────────────────────────────────
+    print("📥 Loading legal data…")
+    if not os.path.exists(DATA_DIR):
+        raise FileNotFoundError(f"Data folder not found: {DATA_DIR}")
 
-    docs = []
+    def _load_json_folder(folder_path: str) -> List[dict]:
+        all_items: List[dict] = []
+        for filename in sorted(os.listdir(folder_path)):
+            if not filename.lower().endswith(".json"):
+                continue
+            fpath = os.path.join(folder_path, filename)
+            with open(fpath, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            wrapper_law_name = ""
+            if isinstance(obj, list):
+                articles: List[dict] = []
+                for entry in obj:
+                    if isinstance(entry, dict) and "data" in entry and isinstance(entry["data"], list):
+                        wrapper_law_name = entry.get("law_name", "")
+                        for art in entry["data"]:
+                            art.setdefault("_law_name", wrapper_law_name)
+                        articles.extend(entry["data"])
+                    elif isinstance(entry, dict) and "articles" in entry and isinstance(entry["articles"], list):
+                        wrapper_law_name = entry.get("law_name", "")
+                        for art in entry["articles"]:
+                            art.setdefault("_law_name", wrapper_law_name)
+                        articles.extend(entry["articles"])
+                    elif isinstance(entry, dict):
+                        if not entry.get("_law_name"):
+                            aid = entry.get("article_id", "")
+                            entry["_law_name"] = "الدستور المصري" if "CONST" in aid.upper() else ""
+                        articles.append(entry)
+                all_items.extend(articles)
+            elif isinstance(obj, dict):
+                wrapper_law_name = obj.get("law_name", "")
+                data_key = "data" if "data" in obj else ("articles" if "articles" in obj else None)
+                if data_key:
+                    for art in obj[data_key]:
+                        art.setdefault("_law_name", wrapper_law_name)
+                    all_items.extend(obj[data_key])
+                else:
+                    obj.setdefault("_law_name", wrapper_law_name)
+                    all_items.append(obj)
+        return all_items
+
+    raw_data = _load_json_folder(DATA_DIR)
+    unique: Dict[str, dict] = {}
+    for item in raw_data:
+        key = str(item.get("article_id") or item.get("article_number") or hash(json.dumps(item, ensure_ascii=False)))
+        unique[key] = item
+    data = list(unique.values())
+
+    docs: List[Document] = []
     for item in data:
-        # Build cross-reference section
-        cross_ref_text = ""
-        if item.get('cross_references') and len(item['cross_references']) > 0:
-            cross_ref_text = "\nالمواد ذات الصلة (المراجع المتقاطعة): " + ", ".join(
-                [f"المادة {ref}" for ref in item['cross_references']]
-            )
-        
-        # Construct content
-        page_content = f"""
-        رقم المادة: {item['article_number']}
-        النص الأصلي: {item['original_text']}
-        الشرح المبسط: {item['simplified_summary']}{cross_ref_text}
-        """
+        article_number = item.get("article_number")
+        original_text = item.get("original_text")
+        simplified_summary = item.get("simplified_summary")
+        if not article_number or not original_text or not simplified_summary:
+            continue
+        law_name = item.get("law_name") or item.get("_law_name", "")
+        part_bab = item.get("part (Bab)", "")
+        chapter_fasl = item.get("chapter (Fasl)", "")
+        page_content = (
+            f"القانون: {law_name}\nرقم المادة: {article_number}\n"
+            f"الباب: {part_bab}\nالفصل: {chapter_fasl}\n"
+            f"النص الأصلي: {original_text}\nالشرح المبسط: {simplified_summary}"
+        )
         metadata = {
-            "article_id": item['article_id'],
-            "article_number": str(item['article_number']),
-            "legal_nature": item['legal_nature'],
-            "keywords": ", ".join(item['keywords']),
-            "part": item.get('part (Bab)', ''),
-            "chapter": item.get('chapter (Fasl)', ''),
-            "cross_references": ", ".join([str(ref) for ref in item.get('cross_references', [])])  # Convert list to string
+            "article_id": item.get("article_id") or str(article_number),
+            "article_number": str(article_number),
+            "law_name": law_name,
+            "legal_nature": item.get("legal_nature", ""),
+            "keywords": ", ".join(item.get("keywords", []) or []),
+            "part": part_bab,
+            "chapter": chapter_fasl,
         }
         docs.append(Document(page_content=page_content, metadata=metadata))
-    
-    print(f"✅ Loaded {len(docs)} constitutional articles")
+    print(f"✅ Loaded {len(docs)} legal articles")
 
-    # 2. Embeddings
-    print("Loading embeddings model...")
-    embeddings = HuggingFaceEmbeddings(
-        model_name="Omartificial-Intelligence-Space/GATE-AraBert-v1"
-    )
-    print("✅ Embeddings model ready")
+    # ── 2. EMBEDDINGS ────────────────────────────────────────────
+    print(f"📐 Loading embedding model: {EMBEDDING_MODEL}")
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+    print("✅ Embeddings ready")
 
-    # 3. No splitting - keep articles as complete units
-    chunks = docs
+    # ── 3. VECTOR STORE ──────────────────────────────────────────
+    db_exists = os.path.exists(CHROMA_DIR) and os.listdir(CHROMA_DIR)
+    if db_exists:
+        print("📦 Loading persisted Chroma DB…")
+        vectorstore = Chroma(persist_directory=CHROMA_DIR, embedding_function=embeddings)
+        stored_count = vectorstore._collection.count()
+        if stored_count == 0 or abs(stored_count - len(docs)) > 5:
+            print(f"⚠️  Count mismatch. Rebuilding…")
+            import shutil
+            shutil.rmtree(CHROMA_DIR, ignore_errors=True)
+            db_exists = False
+        else:
+            print(f"✅ Chroma DB loaded ({stored_count} vectors)")
+    if not db_exists:
+        print("🧱 Building Chroma DB…")
+        vectorstore = Chroma.from_documents(docs, embeddings, persist_directory=CHROMA_DIR)
+        print(f"✅ Chroma DB built ({len(docs)} vectors)")
 
-    # 4. Vector Store
-    print("Building vector database...")
-    vectorstore = Chroma.from_documents(
-        chunks,
-        embeddings,
-        persist_directory="chroma_db"
-    )
-    base_retriever = vectorstore.as_retriever(search_kwargs={"k": 15})
-    print("✅ Vector database ready")
+    base_retriever = vectorstore.as_retriever(search_kwargs={"k": SEMANTIC_K})
 
-    # 5. Create BM25 Keyword Retriever
+    # ── 4. BM25 RETRIEVER ────────────────────────────────────────
     class BM25Retriever(BaseRetriever):
-        """BM25-based keyword retriever for constitutional articles"""
         corpus_docs: List[Document]
-        bm25: BM25Okapi = None
-        k: int = 15
-        
+        bm25: Optional[BM25Okapi] = None
+        tokenized_corpus: Optional[list] = None
+        k: int = BM25_K
         class Config:
             arbitrary_types_allowed = True
-        
-        def __init__(self, **data):
-            super().__init__(**data)
-            # Tokenize corpus for BM25
-            tokenized_corpus = [doc.page_content.split() for doc in self.corpus_docs]
-            self.bm25 = BM25Okapi(tokenized_corpus)
-        
-        def _get_relevant_documents(
-            self, query: str, *, run_manager: CallbackManagerForRetrieverRun = None
-        ) -> List[Document]:
-            # Tokenize query
-            tokenized_query = query.split()
-            # Get BM25 scores
-            scores = self.bm25.get_scores(tokenized_query)
-            # Get top k indices
-            top_indices = np.argsort(scores)[::-1][:self.k]
-            # Return documents
-            return [self.corpus_docs[i] for i in top_indices if scores[i] > 0]
-        
-        async def _aget_relevant_documents(
-            self, query: str, *, run_manager: CallbackManagerForRetrieverRun = None
-        ) -> List[Document]:
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.tokenized_corpus = [arabic_tokenize(d.page_content) for d in self.corpus_docs]
+            self.bm25 = BM25Okapi(self.tokenized_corpus)
+        def _get_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
+            tokens = arabic_tokenize(query)
+            if not tokens:
+                return []
+            scores = self.bm25.get_scores(tokens)
+            top_idx = np.argsort(scores)[::-1][:self.k]
+            return [self.corpus_docs[i] for i in top_idx if scores[i] > 0]
+        async def _aget_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
             return self._get_relevant_documents(query, run_manager=run_manager)
-    
-    bm25_retriever = BM25Retriever(corpus_docs=docs, k=15)
-    print("✅ BM25 keyword retriever ready")
 
-    # 6. Create Metadata Filter Retriever
+    bm25_retriever = BM25Retriever(corpus_docs=docs, k=BM25_K)
+    print("✅ BM25 retriever ready")
+
+    # ── 5. METADATA RETRIEVER ────────────────────────────────────
     class MetadataFilterRetriever(BaseRetriever):
-        """Metadata-based filtering retriever"""
         corpus_docs: List[Document]
-        k: int = 15
-        
+        keyword_index: Optional[Dict[str, Set[int]]] = None
+        law_name_index: Optional[Dict[str, Set[int]]] = None
+        k: int = METADATA_K
         class Config:
             arbitrary_types_allowed = True
-        
-        def _get_relevant_documents(
-            self, query: str, *, run_manager: CallbackManagerForRetrieverRun = None
-        ) -> List[Document]:
-            query_lower = query.lower()
-            scored_docs = []
-            
-            for doc in self.corpus_docs:
-                score = 0
-                # Match keywords (boosted)
-                keywords = doc.metadata.get('keywords', '').lower()
-                if any(word in keywords for word in query_lower.split()):
-                    score += 4
-                
-                # Match legal nature (boosted)
-                legal_nature = doc.metadata.get('legal_nature', '').lower()
-                if any(word in legal_nature for word in query_lower.split()):
-                    score += 3
-                
-                # Match part/chapter
-                part = doc.metadata.get('part', '').lower()
-                chapter = doc.metadata.get('chapter', '').lower()
-                if any(word in part or word in chapter for word in query_lower.split()):
-                    score += 1
-                
-                # Match in content
-                if any(word in doc.page_content.lower() for word in query_lower.split()):
-                    score += 1
-                
-                if score > 0:
-                    scored_docs.append((doc, score))
-            
-            # Sort by score and return top k
-            scored_docs.sort(key=lambda x: x[1], reverse=True)
-            return [doc for doc, _ in scored_docs[:self.k]]
-        
-        async def _aget_relevant_documents(
-            self, query: str, *, run_manager: CallbackManagerForRetrieverRun = None
-        ) -> List[Document]:
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.keyword_index = defaultdict(set)
+            self.law_name_index = defaultdict(set)
+            for idx, doc in enumerate(self.corpus_docs):
+                kw_text = " ".join([
+                    doc.metadata.get("keywords", ""),
+                    doc.metadata.get("legal_nature", ""),
+                    doc.metadata.get("part", ""),
+                    doc.metadata.get("chapter", ""),
+                ])
+                for tok in arabic_tokenize(kw_text):
+                    self.keyword_index[tok].add(idx)
+                for tok in arabic_tokenize(doc.metadata.get("law_name", "")):
+                    self.law_name_index[tok].add(idx)
+        def _get_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
+            tokens = arabic_tokenize(query)
+            if not tokens:
+                return []
+            scores: Dict[int, float] = defaultdict(float)
+            for tok in tokens:
+                for idx in self.keyword_index.get(tok, set()):
+                    scores[idx] += 3.0
+                for idx in self.law_name_index.get(tok, set()):
+                    scores[idx] += 4.0
+            if not scores:
+                return []
+            top = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:self.k]
+            return [self.corpus_docs[idx] for idx, _ in top]
+        async def _aget_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
             return self._get_relevant_documents(query, run_manager=run_manager)
-    
-    metadata_retriever = MetadataFilterRetriever(corpus_docs=docs, k=15)
-    print("✅ Metadata filter retriever ready")
 
-    # 7. Create Hybrid RRF Retriever
+    metadata_retriever = MetadataFilterRetriever(corpus_docs=docs, k=METADATA_K)
+    print("✅ Metadata retriever ready")
+
+    # ── 6. HYBRID RRF (with Phoenix span) ────────────────────────
     class HybridRRFRetriever(BaseRetriever):
-        """Combines semantic, BM25, and metadata retrievers using Reciprocal Rank Fusion"""
         semantic_retriever: BaseRetriever
         bm25_retriever: BM25Retriever
         metadata_retriever: MetadataFilterRetriever
-        beta_semantic: float = 0.6  # Weight for semantic search
-        beta_keyword: float = 0.25  # Weight for BM25 keyword search
-        beta_metadata: float = 0.15 # Weight for metadata filtering
-        k: int = 60  # RRF constant (typically 60)
-        top_k: int = 25
-        
+        beta_semantic: float = BETA_SEMANTIC
+        beta_keyword: float = BETA_BM25
+        beta_metadata: float = BETA_METADATA
+        k: int = RRF_K
+        top_k: int = RRF_TOP_K
         class Config:
             arbitrary_types_allowed = True
-        
-        def _get_relevant_documents(
-            self, query: str, *, run_manager: CallbackManagerForRetrieverRun = None
-        ) -> List[Document]:
-            # Get results from all three retrievers (no separate spans - details logged in hybrid_retrieval span)
-            semantic_docs = self.semantic_retriever.invoke(query)
-            bm25_docs = self.bm25_retriever.invoke(query)
-            metadata_docs = self.metadata_retriever.invoke(query)
-            
-            # Apply Reciprocal Rank Fusion
-            rrf_scores = {}
-            
-            # Process semantic results
-            for rank, doc in enumerate(semantic_docs, start=1):
-                doc_id = doc.metadata.get('article_number', str(hash(doc.page_content)))
-                rrf_scores[doc_id] = rrf_scores.get(doc_id, 0) + self.beta_semantic / (self.k + rank)
-            
-            # Process BM25 results
-            for rank, doc in enumerate(bm25_docs, start=1):
-                doc_id = doc.metadata.get('article_number', str(hash(doc.page_content)))
-                rrf_scores[doc_id] = rrf_scores.get(doc_id, 0) + self.beta_keyword / (self.k + rank)
-            
-            # Process metadata results
-            for rank, doc in enumerate(metadata_docs, start=1):
-                doc_id = doc.metadata.get('article_number', str(hash(doc.page_content)))
-                rrf_scores[doc_id] = rrf_scores.get(doc_id, 0) + self.beta_metadata / (self.k + rank)
-            
-            # Create document lookup
-            all_docs = {}
-            for doc in semantic_docs + bm25_docs + metadata_docs:
-                doc_id = doc.metadata.get('article_number', str(hash(doc.page_content)))
-                if doc_id not in all_docs:
-                    all_docs[doc_id] = doc
-            
-            # Sort by RRF score
-            sorted_doc_ids = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
-            
-            # Return top k documents
-            result_docs = []
-            for doc_id, score in sorted_doc_ids[:self.top_k]:
-                if doc_id in all_docs:
-                    result_docs.append(all_docs[doc_id])
-            
-            # Log all retrieval details in one place (no nested spans to avoid hierarchy issues)
-            try:
-                with PhoenixSpan("hybrid_retrieval", {
-                    "query": query[:200],
-                    "beta_semantic": self.beta_semantic,
-                    "beta_keyword": self.beta_keyword,
-                    "beta_metadata": self.beta_metadata,
-                    "rrf_k_constant": self.k,
-                    "top_k_limit": self.top_k
-                }, kind="INTERNAL") as fusion_span:
-                    # Semantic retrieval details
-                    fusion_span.set_attr("semantic_input_count", len(semantic_docs))
-                    if semantic_docs:
-                        fusion_span.set_attr("semantic_top_5", ", ".join([d.metadata.get('article_number', 'N/A') for d in semantic_docs[:5]]))
-                    
-                    # BM25 retrieval details
-                    fusion_span.set_attr("bm25_input_count", len(bm25_docs))
-                    if bm25_docs:
-                        fusion_span.set_attr("bm25_top_5", ", ".join([d.metadata.get('article_number', 'N/A') for d in bm25_docs[:5]]))
-                    
-                    # Metadata retrieval details
-                    fusion_span.set_attr("metadata_input_count", len(metadata_docs))
-                    if metadata_docs:
-                        fusion_span.set_attr("metadata_top_5", ", ".join([d.metadata.get('article_number', 'N/A') for d in metadata_docs[:5]]))
-                    
-                    # Fusion results
-                    fusion_span.set_attr("unique_docs_before_fusion", len(all_docs))
-                    fusion_span.set_attr("final_doc_count", len(result_docs))
-                    if result_docs:
-                        top_article_nums = [d.metadata.get('article_number', 'N/A') for d in result_docs[:10]]
-                        fusion_span.set_attr("fused_top_10_articles", ", ".join(map(str, top_article_nums)))
-                        # Show top 5 RRF scores
-                        top_scores = [(doc_id, f"{score:.4f}") for doc_id, score in sorted_doc_ids[:5]]
-                        fusion_span.set_attr("top_5_rrf_scores", str(top_scores))
-                        fusion_span.set_attr("top_doc_preview", result_docs[0].page_content[:300])
-            except Exception:
-                pass
-            
-            return result_docs
-        
-        async def _aget_relevant_documents(
-            self, query: str, *, run_manager: CallbackManagerForRetrieverRun = None
-        ) -> List[Document]:
+        def _get_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
+            with PhoenixSpan("hybrid_retrieval", {
+                "query": query[:200],
+                "beta_semantic": self.beta_semantic,
+                "beta_keyword": self.beta_keyword,
+                "beta_metadata": self.beta_metadata,
+            }) as span:
+                with ThreadPoolExecutor(max_workers=3) as pool:
+                    f_sem = pool.submit(self.semantic_retriever.invoke, query)
+                    f_bm25 = pool.submit(self.bm25_retriever.invoke, query)
+                    f_meta = pool.submit(self.metadata_retriever.invoke, query)
+                    semantic_docs = f_sem.result()
+                    bm25_docs = f_bm25.result()
+                    meta_docs = f_meta.result()
+
+                span.set_attr("semantic_count", len(semantic_docs))
+                span.set_attr("bm25_count", len(bm25_docs))
+                span.set_attr("metadata_count", len(meta_docs))
+
+                rrf_scores: Dict[str, float] = {}
+                all_docs: Dict[str, Document] = {}
+                for weight, doc_list in [
+                    (self.beta_semantic, semantic_docs),
+                    (self.beta_keyword, bm25_docs),
+                    (self.beta_metadata, meta_docs),
+                ]:
+                    for rank, doc in enumerate(doc_list, start=1):
+                        did = doc.metadata.get("article_id") or doc.metadata.get("article_number") or str(hash(doc.page_content))
+                        rrf_scores[did] = rrf_scores.get(did, 0.0) + weight / (self.k + rank)
+                        all_docs.setdefault(did, doc)
+
+                sorted_ids = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+                result = [all_docs[did] for did, _ in sorted_ids[:self.top_k] if did in all_docs]
+                span.set_attr("fused_count", len(result))
+                if result:
+                    span.set_attr("top_articles", ", ".join(d.metadata.get("article_number", "?") for d in result[:5]))
+                return result
+        async def _aget_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
             return self._get_relevant_documents(query, run_manager=run_manager)
-    
-    # Create hybrid retriever with tuned beta weights
+
     hybrid_retriever = HybridRRFRetriever(
         semantic_retriever=base_retriever,
         bm25_retriever=bm25_retriever,
         metadata_retriever=metadata_retriever,
-        beta_semantic=0.6,   # Semantic search gets highest weight (most reliable)
-        beta_keyword=0.25,   # BM25 keyword search (good for exact term matches)
-        beta_metadata=0.15,  # Metadata filtering (supporting role)
-        k=60,
-        top_k=25
+        beta_semantic=BETA_SEMANTIC, beta_keyword=BETA_BM25, beta_metadata=BETA_METADATA,
+        k=RRF_K, top_k=RRF_TOP_K,
     )
-    print("✅ Hybrid RRF retriever ready with β weights: semantic=0.6, keyword=0.25, metadata=0.15, top_k=25")
+    print(f"✅ Hybrid RRF retriever (β: {BETA_SEMANTIC}/{BETA_BM25}/{BETA_METADATA})")
 
-    # 8. Create Cross-Reference Enhanced Retriever
-    class CrossReferenceRetriever(BaseRetriever):
-        """Enhances retrieval by automatically fetching cross-referenced articles"""
-        base_retriever: BaseRetriever
-        article_map: dict
-        
-        class Config:
-            arbitrary_types_allowed = True
-        
-        def _get_relevant_documents(
-            self, query: str, *, run_manager: CallbackManagerForRetrieverRun = None
-        ) -> List[Document]:
-            with PhoenixSpan("cross_reference_expansion", {"query": query[:200]}, kind="INTERNAL") as xref_span:
-                # Get initial results
-                initial_docs = self.base_retriever.invoke(query)
-                xref_span.set_attr("initial_doc_count", len(initial_docs))
-                
-                # Collect all related article numbers
-                all_article_numbers = set()
-                for doc in initial_docs:
-                    if 'article_number' in doc.metadata:
-                        all_article_numbers.add(doc.metadata['article_number'])
-                    # Parse cross_references (now stored as comma-separated string)
-                    cross_refs_str = doc.metadata.get('cross_references', '')
-                    if cross_refs_str:
-                        cross_refs = [ref.strip() for ref in cross_refs_str.split(',')]
-                        for ref in cross_refs:
-                            if ref:  # Skip empty strings
-                                all_article_numbers.add(str(ref))
-                
-                # Build enhanced document list
-                enhanced_docs = []
-                seen_numbers = set()
-                
-                # Add initially retrieved documents
-                for doc in initial_docs:
-                    enhanced_docs.append(doc)
-                    seen_numbers.add(doc.metadata.get('article_number'))
-                
-                # Add cross-referenced articles not yet retrieved
-                for article_num in all_article_numbers:
-                    if article_num not in seen_numbers and article_num in self.article_map:
-                        article_data = self.article_map[article_num]
-                        cross_ref_text = ""
-                        if article_data.get('cross_references'):
-                            cross_ref_text = "\nالمواد ذات الصلة: " + ", ".join(
-                                [f"المادة {ref}" for ref in article_data['cross_references']]
-                            )
-                        
-                        page_content = f"""
-                        رقم المادة: {article_data['article_number']}
-                        النص الأصلي: {article_data['original_text']}
-                        الشرح المبسط: {article_data['simplified_summary']}{cross_ref_text}
-                        """
-                        
-                        enhanced_doc = Document(
-                            page_content=page_content,
-                            metadata={
-                                "article_id": article_data['article_id'],
-                                "article_number": str(article_data['article_number']),
-                                "legal_nature": article_data['legal_nature'],
-                                "keywords": ", ".join(article_data['keywords']),
-                                "cross_references": ", ".join([str(ref) for ref in article_data.get('cross_references', [])])
-                            }
-                        )
-                        enhanced_docs.append(enhanced_doc)
-                        seen_numbers.add(article_num)
-                
-                # Record expansion stats (OUTSIDE the loop, at the end)
-                expanded_articles = [doc.metadata.get('article_number') for doc in enhanced_docs if doc not in initial_docs]
-                xref_span.set_attr("cross_refs_added", len(expanded_articles))
-                xref_span.set_attr("final_doc_count", len(enhanced_docs))
-                if expanded_articles:
-                    xref_span.set_attr("expanded_article_numbers", ", ".join(map(str, expanded_articles[:15])))
-                
-                return enhanced_docs
-        
-        async def _aget_relevant_documents(
-            self, query: str, *, run_manager: CallbackManagerForRetrieverRun = None
-        ) -> List[Document]:
-            return self._get_relevant_documents(query, run_manager=run_manager)
-    
-    cross_ref_retriever = CrossReferenceRetriever(
-        base_retriever=hybrid_retriever,
-        article_map=article_map
-    )
-    print("✅ Cross-reference retriever ready (using hybrid RRF base)")
+    # ── 7. RERANKER (with Phoenix span) ──────────────────────────
+    print("🔃 Loading reranker…")
+    if not os.path.exists(RERANKER_DIR):
+        raise FileNotFoundError(f"Reranker not found: {RERANKER_DIR}")
 
-    # 9. Reranker
-    print("Loading reranker model...")
-    local_model_path = r"D:\FOE\Senior 2\Graduation Project\Chatbot_me\reranker"
-    
-    if not os.path.exists(local_model_path):
-        raise FileNotFoundError(f"Reranker path not found: {local_model_path}")
+    cross_encoder = HuggingFaceCrossEncoder(model_name=RERANKER_DIR)
+    compressor = CrossEncoderReranker(model=cross_encoder, top_n=RERANKER_TOP_N)
+    _base_compression = ContextualCompressionRetriever(base_compressor=compressor, base_retriever=hybrid_retriever)
 
-    model = HuggingFaceCrossEncoder(model_name=local_model_path)
-    compressor = CrossEncoderReranker(model=model, top_n=10)
-
-    # Wrap compression retriever to add Phoenix spans
     class InstrumentedCompressionRetriever(BaseRetriever):
         base_retriever: ContextualCompressionRetriever
-        
         class Config:
             arbitrary_types_allowed = True
-        
-        def _get_relevant_documents(
-            self, query: str, *, run_manager: CallbackManagerForRetrieverRun = None
-        ) -> List[Document]:
-            with PhoenixSpan("reranker_compression", {
-                "query": query[:200],
-                "model": "HuggingFaceCrossEncoder",
-                "top_n": 10
-            }, kind="INTERNAL") as rerank_span:
-                # Apply reranking (this will call cross_ref_retriever internally)
-                reranked_docs = self.base_retriever.invoke(query)
-                
-                rerank_span.set_attr("output_doc_count", len(reranked_docs))
-                if reranked_docs:
-                    output_articles = [d.metadata.get('article_number', 'N/A') for d in reranked_docs]
-                    rerank_span.set_attr("reranked_articles", ", ".join(map(str, output_articles)))
-                    rerank_span.set_attr("top_doc_preview", reranked_docs[0].page_content[:400] if reranked_docs else "")
-                
-                return reranked_docs
-        
-        async def _aget_relevant_documents(
-            self, query: str, *, run_manager: CallbackManagerForRetrieverRun = None
-        ) -> List[Document]:
+        def _get_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
+            with PhoenixSpan("reranker_compression", {"query": query[:200], "top_n": RERANKER_TOP_N}) as span:
+                docs = self.base_retriever.invoke(query)
+                span.set_attr("output_count", len(docs))
+                if docs:
+                    span.set_attr("articles", ", ".join(d.metadata.get("article_number", "?") for d in docs))
+                return docs
+        async def _aget_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
             return self._get_relevant_documents(query, run_manager=run_manager)
-    
-    base_compression_retriever = ContextualCompressionRetriever(
-        base_compressor=compressor,
-        base_retriever=cross_ref_retriever
-    )
-    compression_retriever = InstrumentedCompressionRetriever(base_retriever=base_compression_retriever)
-    print("✅ Reranker model ready")
 
-    # 7. LLM - More deterministic for relevance
-    # 7. LLM Configuration
+    compression_retriever = InstrumentedCompressionRetriever(base_retriever=_base_compression)
+    print(f"✅ Reranker ready (top_n={RERANKER_TOP_N})")
+
+    # ── 8. LLM ───────────────────────────────────────────────────
     llm = ChatGroq(
         groq_api_key=os.getenv("GROQ_API_KEY"),
-        model_name="llama-3.1-8b-instant",
-        temperature=0.1,
-        model_kwargs={"top_p": 0.9}
+        model_name=LLM_MODEL,
+        temperature=LLM_TEMPERATURE,
+        model_kwargs={"top_p": LLM_TOP_P},
+        max_retries=LLM_MAX_RETRIES,
+        request_timeout=LLM_TIMEOUT,
     )
 
-# ==================================================
-    # 🛠️ THE FIX: SEPARATE SYSTEM INSTRUCTIONS FROM USER INPUT
-    # ==================================================
-    
-# ==================================================
-    # 🧠 PROMPT ENGINEERING: DECISION TREE LOGIC
-    # ==================================================
-    
-    system_instructions = """
-    <role>
-    أنت "المساعد القانوني الذكي"، خبير متخصص في الدستور المصري والقوانين الإجرائية.
-    مهمتك: تقديم إجابات دقيقة بناءً على "السياق التشريعي" المرفق أولاً، أو تقديم نصائح إجرائية عامة عند الضرورة.
-    </role>
-
-    <decision_logic>
-    عليك تحليل "سؤال المستخدم" و"السياق التشريعي" وتصنيف الحالة واختيار الرد المناسب بناءً على القواعد التالية بدقة:
-
-    🔴 الحالة الأولى: (الإجابة موجودة في السياق التشريعي)
-    الشرط: إذا وجدت معلومات داخل "السياق التشريعي المتاح" تجيب على السؤال.
-    الفعل:
-    1. استخرج الإجابة من السياق فقط.
-    2. ابدأ الإجابة مباشرة دون مقدمات.
-    3. يجب توثيق الإجابة برقم المادة (مثال: "نصت المادة (50) على...").
-    4. توقف هنا. لا تضف أي معلومات خارجية.
-
-    🟡 الحالة الثانية: (السياق فارغ/غير مفيد + السؤال إجرائي/عملي)
-    الشرط: إذا لم تجد الإجابة في السياق، وكان السؤال عن إجراءات عملية (مثل: حادث، سرقة، طلاق، تحرير محضر، تعامل مع الشرطة).
-    الفعل:
-    1. تجاهل السياق الفارغ.
-    2. استخدم معرفتك العامة بالقانون المصري.
-    3. ابدأ وجوباً بعبارة: "بناءً على الإجراءات القانونية العامة في مصر (وليس نصاً دستورياً محدداً):"
-    4. قدم الخطوات في نقاط مرقمة واضحة ومختصرة (1، 2، 3).
-    5. تحذير: لا تذكر أرقام مواد قانونية (لا تخترع أرقام مواد).
-
-    🔵 الحالة الثالثة: (السياق فارغ + السؤال عن نص دستوري محدد)
-    الشرط: إذا سأل عن (مجلس الشعب، الشورى، مادة محددة) ولم تجدها في السياق.
-    الفعل:
-    1. قل بوضوح: "عذراً، لم يرد ذكر لهذا الموضوع في المواد الدستورية التي تم استرجاعها في السياق الحالي."
-    2. لا تحاول الإجابة من ذاكرتك لكي لا تخطئ في النصوص الدستورية الحساسة.
-
-    🟢 الحالة الرابعة: (محادثة ودية)
-    الشرط: تحية، شكر، أو "كيف حالك".
-    الفعل: رد بتحية مهذبة جداً ومقتضبة، ثم قل: "أنا جاهز للإجابة على استفساراتك القانونية."
-
-    ⚫ الحالة الخامسة: (خارج النطاق تماماً)
-    الشرط: طبخ، رياضة، برمجة، أو أي موضوع غير قانوني.
-    الفعل: اعتذر بلطف ووجه المستخدم للسؤال في القانون.
-    </decision_logic>
-
-    <formatting_rules>
-    - لا تكرر هذه التعليمات في ردك.
-    - استخدم فقرات قصيرة واترك سطراً فارغاً بينها.
-    - لا تستخدم عبارات مثل "بناء على السياق المرفق" في بداية الجملة، بل ادخل في صلب الموضوع فوراً.
-    - التزم باللغة العربية الفصحى المبسطة والرصينة.
-    </formatting_rules>
-    """
-
-    # We use .from_messages to strictly separate instructions from data
+    # ── 9. PROMPT ────────────────────────────────────────────────
     prompt = ChatPromptTemplate.from_messages([
-        ("system", system_instructions),
-        ("system", "السياق التشريعي المتاح (المصدر الأساسي):\n{context}"), 
-        ("human", "سؤال المستفيد:\n{input}")
+        ("system", SYSTEM_INSTRUCTIONS),
+        ("system", "السياق التشريعي المتاح (المصدر الأساسي):\n{context}"),
+        MessagesPlaceholder(variable_name="chat_history"),
+        ("human", "سؤال المستفيد:\n{input}"),
     ])
-    
-    # 9. Build Chain with RunnableParallel (returns both context and answer)
+
+    # ── 10. CHAIN ────────────────────────────────────────────────
+    def _format_context(docs: List[Document]) -> str:
+        return "\n\n---\n\n".join(d.page_content for d in docs)
+
     qa_chain = (
         RunnableParallel({
-            "context": compression_retriever, 
-            "input": RunnablePassthrough()
+            "context": compression_retriever,
+            "input": RunnablePassthrough(),
         })
-        .assign(answer=(
-            prompt
-            | llm
-            | StrOutputParser()
-        ))
+        .assign(
+            chat_history=lambda x: x.get("chat_history", []),
+            answer=(
+                RunnableLambda(lambda x: {
+                    "context": _format_context(x["context"]),
+                    "input": x["input"],
+                    "chat_history": x.get("chat_history", []),
+                })
+                | prompt
+                | llm
+                | StrOutputParser()
+            ),
+        )
     )
-    
-    print("✅ System ready to use!")
+    print("✅ System ready!")
     return qa_chain
 
-# ==========================================
-# ⚡ MAIN EXECUTION
-# ==========================================
 
+# ═══════════════════════════════════════════════════════════════════
+# MAIN APP
+# ═══════════════════════════════════════════════════════════════════
 try:
-    # Only need the chain now - it handles all retrieval internally
     qa_chain = initialize_rag_pipeline()
-    
 except Exception as e:
-    st.error(f"Critical Error loading application: {e}")
+    st.error(f"خطأ فادح: {e}")
     st.stop()
 
-# ==========================================
-# 💬 CHAT LOOP
-# ==========================================
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Display Chat History (with Eastern Arabic numerals)
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        # Convert to Eastern Arabic when displaying from history
-        st.markdown(convert_to_eastern_arabic(message["content"]))
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(convert_to_eastern_arabic(msg["content"]))
 
-# Handle New User Input
-if prompt_input := st.chat_input("اكتب سؤالك القانوني هنا..."):
-    # Show user message
+if prompt_input := st.chat_input("اكتب سؤالك القانوني هنا…"):
     st.session_state.messages.append({"role": "user", "content": prompt_input})
     with st.chat_message("user"):
         st.markdown(prompt_input)
 
-    # Generate Response
     with st.chat_message("assistant"):
-        with st.spinner("جاري التحليل القانوني..."):
+        with st.spinner("جاري التحليل القانوني…"):
             try:
-                # Invoke chain ONCE - returns Dict with 'context', 'input', and 'answer'
+                history = format_chat_history(st.session_state.messages[:-1])
+
                 with PhoenixSpan("chat_request", {
-                    "question": prompt_input,
-                    "question_len": len(prompt_input or ""),
+                    "question": prompt_input[:300],
                     "timestamp": datetime.utcnow().isoformat(),
-                }, kind="SERVER") as span:
-                    result = qa_chain.invoke(prompt_input)
-                    
-                    # Extract answer and context from result
-                    response_text = result["answer"]
-                    source_docs = result["context"]
-                    
-                    # Attach detailed context attributes
-                    try:
-                        ctx_list = result.get("context", []) or []
-                        ctx_count = len(ctx_list)
-                        span.set_attr("context_count", ctx_count)
-                        if ctx_count:
-                            # Record all article numbers
-                            article_nums = [doc.metadata.get("article_number", "N/A") for doc in ctx_list]
-                            span.set_attr("context_articles", ", ".join(map(str, article_nums)))
-                            # Record legal natures
-                            legal_natures = [doc.metadata.get("legal_nature", "N/A") for doc in ctx_list]
-                            span.set_attr("legal_natures", ", ".join(legal_natures[:5]))
-                            # Add context preview (first doc)
-                            span.set_attr("context_preview", ctx_list[0].page_content[:500])
-                    except Exception:
-                        pass
-                    
-                    # Log LLM generation as a nested span (properly nested under chat_request)
+                }, kind="SERVER") as req_span:
+                    result = qa_chain.invoke({"input": prompt_input, "chat_history": history})
+
+                    response_text = result.get("answer", "") if isinstance(result, dict) else str(result)
+                    source_docs = result.get("context", []) if isinstance(result, dict) else []
+
+                    req_span.set_attr("context_count", len(source_docs))
+                    if source_docs:
+                        req_span.set_attr("articles", ", ".join(d.metadata.get("article_number", "?") for d in source_docs[:10]))
+
                     with PhoenixSpan("llm_generation", {
-                        "model": "llama-3.1-8b-instant",
-                        "temperature": 0.1,
-                        "top_p": 0.9,
-                        "prompt_preview": prompt_input[:300]
+                        "model": LLM_MODEL,
+                        "temperature": LLM_TEMPERATURE,
                     }, kind="CLIENT") as llm_span:
-                        llm_span.set_attr("response", response_text)
                         llm_span.set_attr("response_len", len(response_text))
                         llm_span.set_attr("response_preview", response_text[:500])
-                        llm_span.set_attr("context_docs_used", len(source_docs))
 
-                # Display Answer
-                response_text_arabic = convert_to_eastern_arabic(response_text)
-                st.markdown(response_text_arabic)
-                
-                # Display Sources
-                if source_docs and len(source_docs) > 0:
-                    print(f"✅ Found {len(source_docs)} documents")
-                    # Deduplicate documents by article_number
-                    seen_articles = set()
-                    unique_docs = []
-                    
+                st.markdown(convert_to_eastern_arabic(response_text))
+
+                if source_docs:
+                    seen: Set[str] = set()
+                    unique_docs: List[Document] = []
                     for doc in source_docs:
-                        article_num = str(doc.metadata.get('article_number', '')).strip()
-                        if article_num and article_num not in seen_articles:
-                            seen_articles.add(article_num)
+                        art_num = str(doc.metadata.get("article_number", "")).strip()
+                        if art_num and art_num not in seen:
+                            seen.add(art_num)
                             unique_docs.append(doc)
-                    
-                    st.markdown("---")  # Separator before sources
-                    
+                    st.markdown("---")
                     if unique_docs:
-                        with st.expander(f"📚 المصادر المستخدمة ({len(unique_docs)} مادة)"):
-                            st.markdown("### المواد الدستورية المستخدمة في التحليل:")
-                            st.markdown("---")
-                            
-                            for idx, doc in enumerate(unique_docs, 1):
-                                article_num = str(doc.metadata.get('article_number', '')).strip()
-                                legal_nature = doc.metadata.get('legal_nature', '')
-                                
-                                if article_num:
-                                    st.markdown(f"**المادة رقم {convert_to_eastern_arabic(article_num)}**")
-                                    if legal_nature:
-                                        st.markdown(f"*الطبيعة القانونية: {legal_nature}*")
-                                    
-                                    # Display article content
-                                    content_lines = doc.page_content.strip().split('\n')
-                                    for line in content_lines:
-                                        line = line.strip()
-                                        if line:
-                                            st.markdown(convert_to_eastern_arabic(line))
-                                    
-                                    st.markdown("---")
+                        with st.expander(f"📚 المصادر ({len(unique_docs)} مادة)"):
+                            for doc in unique_docs:
+                                art_num = str(doc.metadata.get("article_number", "")).strip()
+                                law = doc.metadata.get("law_name", "")
+                                nature = doc.metadata.get("legal_nature", "")
+                                header = f"**المادة رقم {convert_to_eastern_arabic(art_num)}**"
+                                if law:
+                                    header += f" — {law}"
+                                st.markdown(header)
+                                if nature:
+                                    st.markdown(f"*{nature}*")
+                                for line in doc.page_content.strip().split("\n"):
+                                    line = line.strip()
+                                    if line:
+                                        st.markdown(convert_to_eastern_arabic(line))
+                                st.markdown("---")
                     else:
                         st.info("📌 لم يتم العثور على مصادر")
                 else:
                     st.info("📌 لم يتم العثور على مصادر")
-                
-                # Persist the raw answer to avoid double conversion glitches on rerun
+
                 st.session_state.messages.append({"role": "assistant", "content": response_text})
             except Exception as e:
                 st.error(f"حدث خطأ: {e}")

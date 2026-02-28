@@ -1,3 +1,6 @@
+# Archive (old/redundant files)
+archive/
+
 # Python
 __pycache__/
 *.py[cod]

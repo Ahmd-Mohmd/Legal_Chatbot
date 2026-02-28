@@ -1,383 +1,421 @@
-# ⚖️ Constitutional Legal Assistant - Egyptian Constitution Chatbot
+# ⚖️ Egyptian Legal AI Assistant
 
-An intelligent RAG-based chatbot for answering questions about the Egyptian Constitution in Arabic.
+> **Multi-Law Arabic RAG Chatbot** — An advanced Retrieval-Augmented Generation system covering 6 Egyptian legal domains with hybrid search, cross-encoder reranking, and conversational memory.
+
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://python.org)
+[![Streamlit](https://img.shields.io/badge/UI-Streamlit-FF4B4B.svg)](https://streamlit.io)
+[![LangChain](https://img.shields.io/badge/Framework-LangChain-green.svg)](https://langchain.com)
+[![Groq](https://img.shields.io/badge/LLM-Groq%20%7C%20Llama%203.3%2070B-orange.svg)](https://groq.com)
 
 ---
 
-## 📁 Project Structure
+## 📋 Table of Contents
+
+- [Overview](#overview)
+- [Problem & Solution](#problem--solution)
+- [System Architecture](#system-architecture)
+- [Legal Domains](#legal-domains)
+- [Technology Stack](#technology-stack)
+- [Project Structure](#project-structure)
+- [Setup & Installation](#setup--installation)
+- [Running the Application](#running-the-application)
+- [Evaluation](#evaluation)
+- [Architecture Deep Dive](#architecture-deep-dive)
+- [Configuration Reference](#configuration-reference)
+- [Observability with Phoenix](#observability-with-phoenix)
+- [License](#license)
+
+---
+
+## Overview
+
+This project is a **graduation project** that implements an AI-powered legal assistant for Egyptian law. Users can ask legal questions in Arabic, and the system retrieves relevant articles from 6 major Egyptian legal codes, reranks them for precision, and generates accurate answers using a large language model.
+
+### Key Features
+
+- **6 Egyptian Legal Domains** — Constitution, Civil Law, Labour Law, Personal Status, Technology Crimes, Criminal Procedures
+- **Hybrid Retrieval** — Combines semantic search, BM25 keyword search, and metadata filtering via Reciprocal Rank Fusion (RRF)
+- **Cross-Encoder Reranking** — Arabic-tuned ARM-V1 reranker for high-precision document selection
+- **Conversational Memory** — Last 3 Q&A turns preserved for follow-up questions
+- **A/B Embedding Comparison** — Switch between GATE-AraBert-v1 and Arabic-Triplet-Matryoshka-V2 via environment variable
+- **Multi-Key Evaluation** — 4 Groq API keys with round-robin rotation for faster evaluation
+- **Full Observability** — Optional Arize Phoenix tracing via OpenTelemetry
+
+---
+
+## Problem & Solution
+
+### Problem
+
+Egyptian citizens, law students, and legal practitioners often struggle to navigate the complex landscape of Egyptian legislation. With thousands of articles spread across multiple legal codes written in formal Arabic, finding the relevant provision for a specific question is time-consuming and requires specialized expertise.
+
+### Solution
+
+This system provides an **intelligent, conversational interface** that:
+
+1. **Understands** Arabic legal questions with semantic awareness
+2. **Retrieves** the most relevant articles from a structured knowledge base
+3. **Ranks** results using a cross-encoder model fine-tuned for Arabic
+4. **Generates** accurate, citation-backed answers using Llama 3.3 70B
+5. **Remembers** context from previous turns for natural conversation flow
+
+---
+
+## System Architecture
+
+```mermaid
+graph TD
+    A[👤 User Question<br>Arabic] --> B[Streamlit UI]
+    B --> C{Hybrid Retriever}
+    
+    C --> D[Semantic Search<br>k=10]
+    C --> E[BM25 Keyword<br>k=10]
+    C --> F[Metadata Filter<br>k=10]
+    
+    D --> G[RRF Fusion<br>β: 0.50 / 0.30 / 0.20]
+    E --> G
+    F --> G
+    
+    G --> H[Top 12 Candidates]
+    H --> I[ARM-V1 Reranker<br>Cross-Encoder]
+    I --> J[Top 5 Documents]
+    
+    J --> K[LLM — Llama 3.3 70B<br>via Groq API]
+    L[Chat History<br>Last 3 Turns] --> K
+    M[System Prompt<br>Legal Expert] --> K
+    
+    K --> N[📝 Answer with<br>Article Citations]
+    N --> B
+
+    style A fill:#e1f5fe
+    style K fill:#fff3e0
+    style I fill:#f3e5f5
+    style G fill:#e8f5e9
+```
+
+---
+
+## Legal Domains
+
+| # | Domain | File | Articles | Description |
+|---|--------|------|----------|-------------|
+| 1 | 🏛️ Constitution | `Egyptian_Constitution_legalnature_only.json` | ~230 | The Egyptian Constitution (2014, amended 2019) |
+| 2 | 📜 Civil Law | `Egyptian_Civil.json` | ~1000+ | Civil Code — contracts, obligations, property |
+| 3 | 👷 Labour Law | `Egyptian_Labour_Law.json` | ~250+ | Labour regulations — employment, wages, disputes |
+| 4 | 👨‍👩‍👧‍👦 Personal Status | `Egyptian_Personal Status Laws.json` | ~200+ | Family law — marriage, divorce, custody, inheritance |
+| 5 | 💻 Technology Crimes | `Technology Crimes Law.json` | ~40+ | Cybercrime & IT-related offenses |
+| 6 | ⚖️ Criminal Procedures | `قانون_الإجراءات_الجنائية.json` | ~500+ | Criminal procedure code — investigation, prosecution, trial |
+
+All law files are stored in the `data/` directory as structured JSON with article-level metadata (article number, legal nature, source law name, etc.).
+
+---
+
+## Technology Stack
+
+| Component | Technology | Details |
+|-----------|-----------|---------|
+| **LLM** | Groq — Llama 3.3 70B Versatile | `temperature=0.2`, `top_p=0.80`, low-latency inference |
+| **Embeddings** | HuggingFace — GATE-AraBert-v1 | Arabic-optimized sentence embeddings |
+| **Vector Store** | ChromaDB | Persistent local storage, per-model subfolders |
+| **Retrieval** | Hybrid RRF | Semantic + BM25 + Metadata, parallel execution |
+| **Reranker** | ARM-V1 (local) | Cross-encoder based on BAAI/bge-reranker-v2-m3 |
+| **Framework** | LangChain 0.2+ | Chains, retrievers, prompt templates |
+| **UI** | Streamlit | Arabic RTL support, chat interface |
+| **Evaluation** | Ragas | Faithfulness, relevancy, precision, recall |
+| **Observability** | Arize Phoenix + OpenTelemetry | Span-level tracing for debugging |
+| **Language** | Python 3.10+ | Type hints throughout |
+
+---
+
+## Project Structure
 
 ```
-Chatbot_me/
-├── app_final.py                 # Main Streamlit app (v1 - basic)
-├── app_final_pheonix.py         # Streamlit app with Phoenix tracing
-├── app_final_updated.py         # Latest production version with improvements
-├── evaluate_rag.py              # RAG evaluation with RAGAS metrics (simplified output)
-├── evaluate.py                  # Full standalone evaluation script
-├── requirements.txt             # Python dependencies
-├── .env                         # Environment variables (create this - NOT in repo)
-├── .gitignore                   # Git ignore rules
-├── test_dataset_5_questions.json # Test dataset (5 questions from different categories)
-├── data/                        # Legal documents (NOT in repo)
-│   ├── Egyptian_Constitution_legalnature_only.json
+📂 Chatbot_me/
+├── 📄 app_final_updated.py          # Main Streamlit app (production)
+├── 📄 app_final_pheonix.py          # Streamlit app + Phoenix tracing
+├── 📄 evaluate_rag.py               # RAG evaluation with 4-key rotation
+├── 📄 requirements.txt              # Python dependencies
+├── 📄 README.md                     # This file
+├── 📄 ragas_dataset_100.csv         # 100-question evaluation dataset
+├── 📄 test_dataset_5_questions.json  # Small test dataset (5 questions)
+├── 📄 .env                          # API keys (not committed)
+├── 📄 .gitignore                    # Git ignore rules
+│
+├── 📂 data/                         # Law JSON files
 │   ├── Egyptian_Civil.json
+│   ├── Egyptian_Constitution_legalnature_only.json
 │   ├── Egyptian_Labour_Law.json
 │   ├── Egyptian_Personal Status Laws.json
 │   ├── Technology Crimes Law.json
 │   └── قانون_الإجراءات_الجنائية.json
-├── chroma_db/                   # Vector database (auto-generated - NOT in repo)
-├── reranker/                    # Arabic reranker model files (NOT in repo)
-│   ├── model.safetensors
+│
+├── 📂 reranker/                     # Local ARM-V1 cross-encoder model
 │   ├── config.json
+│   ├── model.safetensors
+│   ├── tokenizer.json
+│   ├── sentencepiece.bpe.model
 │   └── ...
-└── *.whl                        # Local wheel packages for Phoenix (NOT in repo)
+│
+├── 📂 chroma_db/                    # ChromaDB persistent vector store
+│
+├── 📂 archive/                      # Archived/deprecated files
+│   ├── app_final.py
+│   ├── evaluate.py
+│   └── ...
+│
+├── 📦 openinference_instrumentation_langchain-*.whl
+└── 📦 openinference_instrumentation_openai-*.whl
 ```
 
 ---
 
-## 🚀 Quick Start
+## Setup & Installation
 
-### Step 1: Create Virtual Environment (Recommended)
+### Prerequisites
 
-```powershell
-# Create virtual environment
-python -m venv venv
+- **Python 3.10+**
+- **Git**
+- **Groq API key** — [Get one free at groq.com](https://console.groq.com)
 
-# Activate it (Windows PowerShell)
-.\venv\Scripts\Activate.ps1
+### 1. Clone the Repository
 
-# Or (Windows CMD)
-.\venv\Scripts\activate.bat
+```bash
+git clone https://github.com/Ahmd-Mohmd/Chatbot_me.git
+cd Chatbot_me
 ```
 
-### Step 2: Install Dependencies
+### 2. Create a Virtual Environment
 
-```powershell
-# Install all requirements
+```bash
+python -m venv venv
+
+# Windows
+venv\Scripts\activate
+
+# macOS/Linux
+source venv/bin/activate
+```
+
+### 3. Install Dependencies
+
+```bash
 pip install -r requirements.txt
 ```
 
-### Step 3: Install Local Wheel Packages (For Phoenix Tracing)
+**Optional** — Install Phoenix tracing wheels (for `app_final_pheonix.py`):
 
-```powershell
-# Install OpenInference instrumentation packages
+```bash
 pip install openinference_instrumentation_langchain-0.1.56-py3-none-any.whl
 pip install openinference_instrumentation_openai-0.1.41-py3-none-any.whl
 ```
 
-### Step 4: Create `.env` File
+### 4. Configure Environment Variables
 
-Create a `.env` file in the project root with:
+Create a `.env` file in the project root:
 
 ```env
-# Required: Groq API Key (get from https://console.groq.com)
-GROQ_API_KEY=gsk_your_groq_api_key_here
+GROQ_API_KEY=gsk_your_primary_key_here
 
-# Optional: For Phoenix tracing
-PHOENIX_OTLP_ENDPOINT=http://localhost:6006/v1/traces
-PHOENIX_SERVICE_NAME=constitutional-assistant
+# Additional keys for evaluation (optional, improves throughput)
+groq_api=gsk_your_second_key
+groq_api_2=gsk_your_third_key
+groq_api_3=gsk_your_fourth_key
+
+# A/B Embedding Switch (optional)
+# EMBEDDING_MODEL=Omartificial-Intelligence-Space/Arabic-Triplet-Matryoshka-V2
 ```
 
 ---
 
-## 🏃 Running the Applications
+## Running the Application
 
-### 1. Run Latest Production App (`app_final_updated.py`) ⭐ RECOMMENDED
+### Main App (Production)
 
-The most recent version with improved prompt engineering and decision tree logic:
-
-```powershell
+```bash
 streamlit run app_final_updated.py
 ```
 
-Then open: **http://localhost:8501**
+Opens the chat interface at `http://localhost:8501`. The first run will:
+1. Load and de-duplicate articles from all 6 law files
+2. Create embeddings and store them in ChromaDB (takes ~5-10 min first time)
+3. Load the ARM-V1 reranker model
 
-**Features:**
-- Enhanced Arabic RTL support
-- Improved decision tree for handling different question types
-- Better handling of procedural vs. constitutional questions
-- Cleaner response formatting
+Subsequent runs load from the ChromaDB cache and start much faster.
 
----
+### App with Phoenix Tracing
 
-### 2. Run Basic App (`app_final.py`)
-
-The original version:
-
-```powershell
-streamlit run app_final.py
-```
-
-Then open: **http://localhost:8501**
-
----
-
-### 3. Run App with Phoenix Tracing (`app_final_pheonix.py`)
-
-This version includes observability/tracing with Phoenix.
-
-#### Step A: Start Phoenix Server First
-
-```powershell
-# In a separate terminal
+```bash
+# Start Phoenix collector first
 python -m phoenix.server.main serve
-```
 
-Phoenix UI will be at: **http://localhost:6006**
-
-#### Step B: Run the App
-
-```powershell
+# Then run the traced app
 streamlit run app_final_pheonix.py
 ```
 
-Then open:
-- **App**: http://localhost:8501
-- **Phoenix Traces**: http://localhost:6006
+View traces at `http://localhost:6006`.
 
 ---
 
-### 4. Run Evaluation (`evaluate_rag.py`) ⭐ NEW SIMPLIFIED FORMAT
+## Evaluation
 
-Evaluate the RAG system with simplified output showing only essential information:
+The evaluation script uses **Ragas** to measure pipeline quality across 4 metrics.
 
-```powershell
-# Uses default test dataset (test_dataset_5_questions.json)
+### Metrics
+
+| Metric | Description |
+|--------|-------------|
+| **Faithfulness** | Is the answer grounded in the retrieved context? |
+| **Answer Relevancy** | Does the answer address the question? |
+| **Context Precision** | Are the retrieved documents relevant to the question? |
+| **Context Recall** | Do the retrieved documents cover the ground truth? |
+
+### Run Evaluation
+
+```bash
+# Default: evaluates all 100 questions from ragas_dataset_100.csv
 python evaluate_rag.py
 
-# With custom test file
-python evaluate_rag.py path/to/your_test.json
+# Custom dataset
+python evaluate_rag.py path/to/questions.csv
 
-# Set via environment variable
-set QA_FILE_PATH=test_dataset_5_questions.json
+# Via environment variable
+set QA_FILE_PATH=ragas_dataset_100.csv
 python evaluate_rag.py
 ```
 
-**Output Files:**
-- `evaluation_breakdown.json` - **Simplified format** with:
-  - Question
-  - Ground truth
-  - Actual answer
-  - Score (average of all metrics per question)
-  - Average score across all questions
-- `evaluation_results.json` - Detailed metrics breakdown
-- `evaluation_detailed.json` - Full raw evaluation data
+### Multi-Key Throughput
 
-**Sample Output Format:**
+The evaluation script loads **all 4 Groq API keys** from `.env` and rotates through them:
+
+- **Single key**: ~30 RPM → ~45 min for 100 questions
+- **4 keys**: ~120 RPM → ~15 min for 100 questions
+
+If a key hits rate limits (429), the script automatically falls back to the next key.
+
+### Output Files
+
+| File | Contents |
+|------|----------|
+| `evaluation_results.json` | Average scores, per-category breakdown, config |
+| `evaluation_breakdown.json` | Per-question scores and answers |
+| `evaluation_detailed.json` | Raw questions, answers, and contexts |
+
+---
+
+## Architecture Deep Dive
+
+### 1. Data Ingestion
+
+Each law file is a JSON containing articles with metadata:
 ```json
 {
-  "questions": [
-    {
-      "question": "ما الطبيعة القانونية لحق العمل في الدستور المصري؟",
-      "ground_truth": "حق أساسي/حرية: العمل حق وواجب...",
-      "actual_answer": "حسب المادة (12) من الدستور المصري...",
-      "score": 0.8542
-    }
-  ],
-  "average_score": 0.8542
+  "article_number": "المادة 1",
+  "article_text": "...",
+  "legal_nature": "آمرة",
+  "source_law_name": "القانون المدني المصري"
 }
 ```
 
-**⚠️ Note:** This script has a **60-second delay** between questions to avoid Groq API rate limits.
+Articles are de-duplicated by `(source_law_key, article_number)` to avoid redundancy.
+
+### 2. Embedding & Vector Store
+
+Embeddings are generated using **GATE-AraBert-v1** (or the configured alternative) and stored in ChromaDB. Each embedding model gets its own subfolder (`chroma_db_gate-arabert-v1/` or `chroma_db_arabic-triplet-matryoshka-v2/`) to allow easy A/B comparison.
+
+### 3. Hybrid Retrieval (RRF)
+
+Three retrievers run **in parallel** using `ThreadPoolExecutor`:
+
+| Retriever | Type | k | Weight (β) |
+|-----------|------|---|-----------|
+| Semantic | Vector similarity | 10 | 0.50 |
+| BM25 | Keyword/token matching | 10 | 0.30 |
+| Metadata | Legal-nature filter | 10 | 0.20 |
+
+Results are fused using **Reciprocal Rank Fusion**:
+
+$$RRF(d) = \sum_{r \in R} \frac{\beta_r}{K + \text{rank}_r(d)}$$
+
+Where $K = 60$ (standard RRF constant). The top 12 fused documents proceed to reranking.
+
+### 4. Cross-Encoder Reranking
+
+The **ARM-V1** reranker (based on `BAAI/bge-reranker-v2-m3`, XLMRoberta architecture) scores each `(query, document)` pair and selects the **top 5** most relevant documents.
+
+### 5. LLM Generation
+
+**Groq's Llama 3.3 70B Versatile** generates the final answer with:
+- `temperature = 0.2` — low randomness for legal accuracy
+- `top_p = 0.80` — focused token sampling
+- System prompt enforcing Arabic legal expert persona
+- Chat history (last 3 turns) for contextual follow-ups
+
+### 6. Chat History
+
+The last 3 Q&A turns are formatted as `HumanMessage` / `AIMessage` pairs and injected via LangChain's `MessagesPlaceholder`. This enables:
+- Follow-up questions ("ما هي عقوبته؟" after discussing a crime)
+- Pronoun resolution ("هل ينطبق ذلك على...؟")
+- Conversation continuity without re-stating context
 
 ---
 
-### 5. Run Full Evaluation (`evaluate.py`)
+## Configuration Reference
 
-More comprehensive evaluation with external test dataset and rate limiting:
+All constants are defined at the top of `app_final_updated.py`:
 
-```powershell
-# Basic run (uses test_dataset.json)
-python evaluate.py
-
-# With custom test file
-python evaluate.py test_dataset_small.json
-
-# With custom test and output files
-python evaluate.py test_dataset_small.json my_results.json
-```
-
-**⚠️ Note:** This script has a **2-minute delay** between questions to avoid Groq API rate limits.
-
----
-
-## 📊 Test Dataset
-
-The project includes a curated test dataset with 5 questions covering different legal categories:
-
-**`test_dataset_5_questions.json`** includes:
-1. **الدستور (Constitution)** - Constitutional rights and principles
-2. **قانون العمل (Labour Law)** - Workplace rights and regulations
-3. **الإجراءات الجنائية (Criminal Procedures)** - Criminal law procedures
-4. **جرائم تقنية المعلومات (Technology Crimes)** - Cybercrime laws
-5. **الأحوال الشخصية (Personal Status Laws)** - Family law matters
-
-This diverse dataset ensures comprehensive testing across all major legal domains covered by the system.
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `EMBEDDING_MODEL` | `GATE-AraBert-v1` | HuggingFace embedding model name |
+| `SEMANTIC_K` | `10` | Semantic retriever top-k |
+| `BM25_K` | `10` | BM25 retriever top-k |
+| `METADATA_K` | `10` | Metadata retriever top-k |
+| `RRF_K` | `60` | RRF fusion constant |
+| `RRF_TOP_K` | `12` | Documents after RRF fusion |
+| `BETA_SEMANTIC` | `0.50` | RRF weight — semantic |
+| `BETA_BM25` | `0.30` | RRF weight — BM25 |
+| `BETA_METADATA` | `0.20` | RRF weight — metadata |
+| `RERANKER_TOP_N` | `5` | Documents after reranking |
+| `LLM_MODEL` | `llama-3.3-70b-versatile` | Groq model identifier |
+| `LLM_TEMPERATURE` | `0.2` | Generation temperature |
+| `LLM_TOP_P` | `0.80` | Nucleus sampling threshold |
+| `CHAT_HISTORY_TURNS` | `3` | Past Q&A turns to include |
 
 ---
 
-## 📊 Understanding RAGAS Metrics
+## Observability with Phoenix
 
-The evaluation system uses RAGAS metrics to assess the quality of the RAG pipeline. The simplified output combines these into a single score per question:
+The `app_final_pheonix.py` variant adds **span-level tracing** via OpenTelemetry → Arize Phoenix:
 
-| Metric | Description | Good Score |
-|--------|-------------|------------|
-| **faithfulness** | Is answer grounded in context? | > 0.7 |
-| **answer_relevancy** | Does answer match the question? | > 0.8 |
-| **context_precision** | How much context was useful? | > 0.6 |
-| **context_recall** | Did we retrieve all needed info? | > 0.7 |
+| Span Name | What It Traces |
+|-----------|---------------|
+| `hybrid_retrieval` | All 3 parallel retrievers + RRF fusion |
+| `reranker_compression` | Cross-encoder reranking |
+| `chat_request` | Full chain invocation |
+| `llm_generation` | Groq API call and response |
 
-**Question Score** = Average of all four metrics (0-1 scale)
+### Setup
 
-**Overall Score** = Average of all question scores
+```bash
+# Install Phoenix
+pip install arize-phoenix
 
----
-
-## � Repository Structure & Git
-
-### Files NOT Included in Repository (via `.gitignore`)
-
-The following files are excluded from version control for security, size, or privacy reasons:
-
-1. **`reranker/`** - Large model files (download separately or train locally)
-2. **`__pycache__/`** - Python compiled bytecode
-3. **`chroma_db/`** - Vector database (auto-generated on first run)
-4. **`.env`** - Environment variables with API keys (NEVER commit this!)
-5. **`*.json`** - All JSON files EXCEPT `test_dataset_5_questions.json`
-6. **`*.csv`** - CSV data files
-7. **`*.md`** - All markdown files EXCEPT `README.md`
-8. **`*.whl`** - Wheel package files
-
-### First-Time Setup
-
-When cloning this repository, you'll need to:
-
-1. **Create `.env` file** with your API keys
-2. **Download/prepare data files** in the `data/` folder
-3. **Download reranker model** to `reranker/` folder
-4. **Install dependencies** from `requirements.txt`
-5. **Run the app** - ChromaDB will auto-generate on first run
-
----
-
-## �🔧 Troubleshooting
-
-### "GROQ_API_KEY not found"
-Make sure your `.env` file exists and contains:
-```env
-GROQ_API_KEY=gsk_your_key_here
-```
-
-### "Reranker path not found"
-Ensure the `reranker/` folder exists with model files:
-```
-reranker/
-├── model.safetensors
-├── config.json
-├── tokenizer.json
-└── ...
-```
-
-### "Phoenix connection refused"
-Start Phoenix server first:
-```powershell
+# Start the collector
 python -m phoenix.server.main serve
+
+# Run the traced app
+streamlit run app_final_pheonix.py
 ```
 
-### Rate Limit Errors (Groq)
-- Wait a few minutes and try again
-- Use `test_dataset_small.json` for fewer questions
-- The `evaluate.py` script has built-in 2-minute delays
-
-### Import Errors
-```powershell
-# Reinstall all dependencies
-pip install -r requirements.txt --force-reinstall
-```
+Dashboard: `http://localhost:6006`
 
 ---
 
-## 📝 API Keys Required
+## License
 
-| Service | Purpose | Get Key From |
-|---------|---------|--------------|
-| **Groq** | LLM (Llama 3.1 8B) | https://console.groq.com |
-| **HuggingFace** | Embeddings (auto-download) | No key needed |
+This project is a graduation project for the Faculty of Engineering. All Egyptian legal texts are public domain.
 
 ---
 
-## 🔄 How the System Works
-
-```
-User Question (Arabic)
-        ↓
-┌─────────────────────────────────┐
-│  Decision Tree Logic            │
-│  (app_final_updated.py)         │
-│  ├── Constitutional questions   │
-│  ├── Procedural questions       │
-│  ├── General legal advice       │
-│  └── Out-of-scope filtering     │
-└─────────────────────────────────┘
-        ↓
-┌─────────────────────────────────┐
-│  Hybrid Retrieval (RRF)         │
-│  ├── Semantic Search (50%)      │
-│  ├── BM25 Keyword (30%)         │
-│  └── Metadata Filter (20%)      │
-└─────────────────────────────────┘
-        ↓
-┌─────────────────────────────────┐
-│  Cross-Reference Expansion      │
-│  (Fetch related articles)       │
-└─────────────────────────────────┘
-        ↓
-┌─────────────────────────────────┐
-│  Arabic Reranker (ARM-V1)       │
-│  (Select top 5 most relevant)   │
-└─────────────────────────────────┘
-        ↓
-┌─────────────────────────────────┐
-│  LLM (Llama 3.1 via Groq)       │
-│  (Generate Arabic answer)       │
-│  - Separate system/user prompts │
-│  - Citation with article numbers│
-│  - Temperature: 0.3              │
-└─────────────────────────────────┘
-        ↓
-    Final Answer
-```
-
----
-
-## 📋 Version History
-
-### Latest Updates (Feb 2026)
-- ✅ Added `app_final_updated.py` with improved decision tree logic
-- ✅ Simplified evaluation output (question, ground_truth, answer, score)
-- ✅ Created curated 5-question test dataset covering 5 legal categories
-- ✅ Added comprehensive `.gitignore` for repository management
-- ✅ Updated documentation with all recent changes
-- ✅ Improved Arabic RTL support and number formatting
-
-### Previous Features
-- Multi-source legal document support (Constitution, Civil, Labour, etc.)
-- Hybrid retrieval with RRF (Reciprocal Rank Fusion)
-- Arabic-specific reranker integration
-- Phoenix tracing for observability
-- RAGAS-based evaluation system
-
----
-
-## 📞 Support
-
-For issues, check:
-1. `.env` file has correct API keys
-2. All dependencies installed
-3. `reranker/` folder exists with model files
-4. Internet connection for API calls
-
----
-
-## 📄 License
-
-This project is for educational purposes - Egyptian Constitution Legal Assistant.
+<div align="center">
+  <b>Built with ❤️ for Egyptian Legal AI</b>
+</div>
