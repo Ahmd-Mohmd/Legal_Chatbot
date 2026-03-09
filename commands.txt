@@ -1,0 +1,67 @@
+====================================================
+  Egyptian Legal AI Assistant — Run Commands
+====================================================
+
+PREREQUISITE: Make sure you are in the project directory:
+  cd "d:\FOE\Senior 2\Graduation Project\Chatbot_me"
+
+Make sure .env file exists with at least GROQ_API_KEY set.
+
+----------------------------------------------------
+1. MAIN APP (Production — Streamlit Chat Interface)
+----------------------------------------------------
+  streamlit run app_final_updated.py
+
+  Opens at: http://localhost:8501
+
+----------------------------------------------------
+2. APP WITH PHOENIX TRACING (Observability)
+----------------------------------------------------
+  Step A — Start Phoenix collector first:
+    python -m phoenix.server.main serve
+
+  Step B — In a SEPARATE terminal, run:
+    streamlit run app_final_pheonix.py
+
+  Phoenix dashboard: http://localhost:6006
+  App: http://localhost:8501
+
+----------------------------------------------------
+3. EVALUATION (100 questions from CSV)
+----------------------------------------------------
+  python evaluate_rag.py
+
+  Or with a custom dataset:
+    python evaluate_rag.py ragas_dataset_100.csv
+    python evaluate_rag.py test_dataset_5_questions.json
+
+  Or via environment variable:
+    set QA_FILE_PATH=ragas_dataset_100.csv
+    python evaluate_rag.py
+
+  Output files:
+    - evaluation_results.json    (averages + per-category)
+    - evaluation_breakdown.json  (per-question scores)
+    - evaluation_detailed.json   (raw data)
+
+----------------------------------------------------
+4. INSTALL DEPENDENCIES
+----------------------------------------------------
+  pip install -r requirements.txt
+
+  Optional (Phoenix tracing wheels):
+    pip install openinference_instrumentation_langchain-0.1.56-py3-none-any.whl
+    pip install openinference_instrumentation_openai-0.1.41-py3-none-any.whl
+
+----------------------------------------------------
+5. SWITCH EMBEDDING MODEL (A/B Testing)
+----------------------------------------------------
+  Default: GATE-AraBert-v1
+
+  To use Arabic-Triplet-Matryoshka-V2 instead:
+    set EMBEDDING_MODEL=Omartificial-Intelligence-Space/Arabic-Triplet-Matryoshka-V2
+    streamlit run app_final_updated.py
+
+  (First run with a new model rebuilds ChromaDB — takes ~5-10 min)
+
+====================================================

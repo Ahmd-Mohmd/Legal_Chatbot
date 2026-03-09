@@ -15,11 +15,14 @@ import sys
 import json
 import re
 import time
-from datetime import datetime
+import shutil
+import hashlib
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 import logging
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from collections import defaultdict
 from typing import List, Dict, Set, Tuple, Optional
 
@@ -66,7 +69,7 @@ _phoenix_tracer = setup_phoenix_tracing()
 class PhoenixSpan:
     """Context manager for creating OpenTelemetry spans with proper hierarchy."""
 
-    def __init__(self, name: str, attributes: dict | None = None, kind: str = "INTERNAL"):
+    def __init__(self, name: str, attributes: Optional[dict] = None, kind: str = "INTERNAL"):
         self.name = name
         self.attributes = attributes or {}
         self.kind = kind
@@ -166,6 +169,7 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 RERANKER_DIR = os.path.join(BASE_DIR, "reranker")
 _model_tag = EMBEDDING_MODEL.split("/")[-1].lower().replace("-", "_")
 CHROMA_DIR = os.path.join(BASE_DIR, f"chroma_db_{_model_tag}")
+EMBEDDING_CACHE_DIR = os.path.join(BASE_DIR, "embedding_cache")
 
 # ═══════════════════════════════════════════════════════════════════
 # STREAMLIT UI
@@ -300,6 +304,7 @@ SYSTEM_INSTRUCTIONS: str = """\
 
 @st.cache_resource
 def initialize_rag_pipeline():
+    _init_t0 = time.time()
     print("🔄 Initialising system…")
 
     # ── 1. LOAD DATA ─────────────────────────────────────────────
@@ -347,12 +352,18 @@ def initialize_rag_pipeline():
                     all_items.append(obj)
         return all_items
 
-    raw_data = _load_json_folder(DATA_DIR)
-    unique: Dict[str, dict] = {}
-    for item in raw_data:
-        key = str(item.get("article_id") or item.get("article_number") or hash(json.dumps(item, ensure_ascii=False)))
-        unique[key] = item
-    data = list(unique.values())
+    with PhoenixSpan("data_loading", {"data_dir": DATA_DIR}) as dl_span:
+        raw_data = _load_json_folder(DATA_DIR)
+        dl_span.set_attr("raw_articles", len(raw_data))
+
+    with PhoenixSpan("data_deduplication", {"raw_count": len(raw_data)}) as dedup_span:
+        unique: Dict[str, dict] = {}
+        for item in raw_data:
+            key = str(item.get("article_id") or item.get("article_number") or hashlib.md5(json.dumps(item, ensure_ascii=False, sort_keys=True).encode()).hexdigest())
+            unique[key] = item
+        data = list(unique.values())
+        dedup_span.set_attr("unique_count", len(data))
+        dedup_span.set_attr("duplicates_removed", len(raw_data) - len(data))
 
     docs: List[Document] = []
     for item in data:
@@ -381,28 +392,46 @@ def initialize_rag_pipeline():
         docs.append(Document(page_content=page_content, metadata=metadata))
     print(f"✅ Loaded {len(docs)} legal articles")
 
-    # ── 2. EMBEDDINGS ────────────────────────────────────────────
+    # ── 2. EMBEDDINGS (cached locally after first download) ─────
     print(f"📐 Loading embedding model: {EMBEDDING_MODEL}")
-    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
-    print("✅ Embeddings ready")
+    os.makedirs(EMBEDDING_CACHE_DIR, exist_ok=True)
+    with PhoenixSpan("embedding_model_load", {
+        "model_name": EMBEDDING_MODEL,
+        "cache_dir": EMBEDDING_CACHE_DIR,
+        "cache_hit": os.path.exists(os.path.join(EMBEDDING_CACHE_DIR, _model_tag)),
+    }) as emb_span:
+        embeddings = HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL,
+            cache_folder=EMBEDDING_CACHE_DIR,
+        )
+        emb_span.set_attr("status", "loaded")
+    print(f"✅ Embeddings ready (cache: {EMBEDDING_CACHE_DIR})")
 
     # ── 3. VECTOR STORE ──────────────────────────────────────────
     db_exists = os.path.exists(CHROMA_DIR) and os.listdir(CHROMA_DIR)
-    if db_exists:
-        print("📦 Loading persisted Chroma DB…")
-        vectorstore = Chroma(persist_directory=CHROMA_DIR, embedding_function=embeddings)
-        stored_count = vectorstore._collection.count()
-        if stored_count == 0 or abs(stored_count - len(docs)) > 5:
-            print(f"⚠️  Count mismatch. Rebuilding…")
-            import shutil
-            shutil.rmtree(CHROMA_DIR, ignore_errors=True)
-            db_exists = False
-        else:
-            print(f"✅ Chroma DB loaded ({stored_count} vectors)")
-    if not db_exists:
-        print("🧱 Building Chroma DB…")
-        vectorstore = Chroma.from_documents(docs, embeddings, persist_directory=CHROMA_DIR)
-        print(f"✅ Chroma DB built ({len(docs)} vectors)")
+    with PhoenixSpan("vectorstore_init", {
+        "chroma_dir": CHROMA_DIR,
+        "cache_exists": bool(db_exists),
+    }) as vs_span:
+        if db_exists:
+            print("📦 Loading persisted Chroma DB…")
+            vectorstore = Chroma(persist_directory=CHROMA_DIR, embedding_function=embeddings)
+            stored_count = vectorstore._collection.count()
+            if stored_count == 0 or abs(stored_count - len(docs)) > 5:
+                print(f"⚠️  Count mismatch. Rebuilding…")
+                shutil.rmtree(CHROMA_DIR, ignore_errors=True)
+                db_exists = False
+                vs_span.set_attr("action", "rebuild_triggered")
+            else:
+                print(f"✅ Chroma DB loaded ({stored_count} vectors)")
+                vs_span.set_attr("action", "loaded_from_cache")
+                vs_span.set_attr("vector_count", stored_count)
+        if not db_exists:
+            print("🧱 Building Chroma DB…")
+            vectorstore = Chroma.from_documents(docs, embeddings, persist_directory=CHROMA_DIR)
+            print(f"✅ Chroma DB built ({len(docs)} vectors)")
+            vs_span.set_attr("action", "built_from_scratch")
+            vs_span.set_attr("vector_count", len(docs))
 
     base_retriever = vectorstore.as_retriever(search_kwargs={"k": SEMANTIC_K})
 
@@ -428,7 +457,9 @@ def initialize_rag_pipeline():
         async def _aget_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
             return self._get_relevant_documents(query, run_manager=run_manager)
 
-    bm25_retriever = BM25Retriever(corpus_docs=docs, k=BM25_K)
+    with PhoenixSpan("bm25_index_build", {"corpus_size": len(docs), "k": BM25_K}) as bm25_span:
+        bm25_retriever = BM25Retriever(corpus_docs=docs, k=BM25_K)
+        bm25_span.set_attr("vocab_size", len(set(t for toks in bm25_retriever.tokenized_corpus for t in toks)))
     print("✅ BM25 retriever ready")
 
     # ── 5. METADATA RETRIEVER ────────────────────────────────────
@@ -471,7 +502,10 @@ def initialize_rag_pipeline():
         async def _aget_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
             return self._get_relevant_documents(query, run_manager=run_manager)
 
-    metadata_retriever = MetadataFilterRetriever(corpus_docs=docs, k=METADATA_K)
+    with PhoenixSpan("metadata_index_build", {"corpus_size": len(docs), "k": METADATA_K}) as meta_span:
+        metadata_retriever = MetadataFilterRetriever(corpus_docs=docs, k=METADATA_K)
+        meta_span.set_attr("keyword_terms", len(metadata_retriever.keyword_index))
+        meta_span.set_attr("law_name_terms", len(metadata_retriever.law_name_index))
     print("✅ Metadata retriever ready")
 
     # ── 6. HYBRID RRF (with Phoenix span) ────────────────────────
@@ -493,35 +527,111 @@ def initialize_rag_pipeline():
                 "beta_keyword": self.beta_keyword,
                 "beta_metadata": self.beta_metadata,
             }) as span:
+                # ── Run 3 retrievers in parallel with individual spans ──
+                # Capture current OTel context so threads inherit the parent span
+                if PHOENIX_AVAILABLE:
+                    from opentelemetry import context as otel_context
+                    _parent_ctx = otel_context.get_current()
+                else:
+                    _parent_ctx = None
+
+                def _run_semantic(q):
+                    if _parent_ctx:
+                        token = otel_context.attach(_parent_ctx)
+                    try:
+                        with PhoenixSpan("semantic_retrieval", {"query": q[:200], "k": SEMANTIC_K}) as s:
+                            docs = self.semantic_retriever.invoke(q)
+                            s.set_attr("result_count", len(docs))
+                            if docs:
+                                s.set_attr("top_article", docs[0].metadata.get("article_number", "?"))
+                            return docs
+                    finally:
+                        if _parent_ctx:
+                            otel_context.detach(token)
+
+                def _run_bm25(q):
+                    if _parent_ctx:
+                        token = otel_context.attach(_parent_ctx)
+                    try:
+                        with PhoenixSpan("bm25_retrieval", {"query": q[:200], "k": BM25_K}) as s:
+                            tokens = arabic_tokenize(q)
+                            s.set_attr("query_tokens", len(tokens))
+                            docs = self.bm25_retriever.invoke(q)
+                            s.set_attr("result_count", len(docs))
+                            if docs:
+                                s.set_attr("top_article", docs[0].metadata.get("article_number", "?"))
+                            return docs
+                    finally:
+                        if _parent_ctx:
+                            otel_context.detach(token)
+
+                def _run_metadata(q):
+                    if _parent_ctx:
+                        token = otel_context.attach(_parent_ctx)
+                    try:
+                        with PhoenixSpan("metadata_retrieval", {"query": q[:200], "k": METADATA_K}) as s:
+                            docs = self.metadata_retriever.invoke(q)
+                            s.set_attr("result_count", len(docs))
+                            if docs:
+                                s.set_attr("top_article", docs[0].metadata.get("article_number", "?"))
+                            return docs
+                    finally:
+                        if _parent_ctx:
+                            otel_context.detach(token)
+
                 with ThreadPoolExecutor(max_workers=3) as pool:
-                    f_sem = pool.submit(self.semantic_retriever.invoke, query)
-                    f_bm25 = pool.submit(self.bm25_retriever.invoke, query)
-                    f_meta = pool.submit(self.metadata_retriever.invoke, query)
-                    semantic_docs = f_sem.result()
-                    bm25_docs = f_bm25.result()
-                    meta_docs = f_meta.result()
+                    f_sem = pool.submit(_run_semantic, query)
+                    f_bm25 = pool.submit(_run_bm25, query)
+                    f_meta = pool.submit(_run_metadata, query)
+                    semantic_docs = f_sem.result(timeout=30)
+                    bm25_docs = f_bm25.result(timeout=30)
+                    meta_docs = f_meta.result(timeout=30)
 
                 span.set_attr("semantic_count", len(semantic_docs))
                 span.set_attr("bm25_count", len(bm25_docs))
                 span.set_attr("metadata_count", len(meta_docs))
+                span.set_attr("total_candidates", len(semantic_docs) + len(bm25_docs) + len(meta_docs))
 
-                rrf_scores: Dict[str, float] = {}
-                all_docs: Dict[str, Document] = {}
-                for weight, doc_list in [
-                    (self.beta_semantic, semantic_docs),
-                    (self.beta_keyword, bm25_docs),
-                    (self.beta_metadata, meta_docs),
-                ]:
-                    for rank, doc in enumerate(doc_list, start=1):
-                        did = doc.metadata.get("article_id") or doc.metadata.get("article_number") or str(hash(doc.page_content))
-                        rrf_scores[did] = rrf_scores.get(did, 0.0) + weight / (self.k + rank)
-                        all_docs.setdefault(did, doc)
+                # ── RRF Fusion with its own span ──
+                with PhoenixSpan("rrf_fusion", {
+                    "rrf_k": self.k,
+                    "top_k": self.top_k,
+                    "input_docs": len(semantic_docs) + len(bm25_docs) + len(meta_docs),
+                }) as fusion_span:
+                    rrf_scores: Dict[str, float] = {}
+                    all_docs: Dict[str, Document] = {}
+                    for weight, doc_list in [
+                        (self.beta_semantic, semantic_docs),
+                        (self.beta_keyword, bm25_docs),
+                        (self.beta_metadata, meta_docs),
+                    ]:
+                        for rank, doc in enumerate(doc_list, start=1):
+                            did = doc.metadata.get("article_id") or doc.metadata.get("article_number") or str(hash(doc.page_content))
+                            rrf_scores[did] = rrf_scores.get(did, 0.0) + weight / (self.k + rank)
+                            all_docs.setdefault(did, doc)
 
-                sorted_ids = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
-                result = [all_docs[did] for did, _ in sorted_ids[:self.top_k] if did in all_docs]
+                    sorted_ids = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+                    result = [all_docs[did] for did, _ in sorted_ids[:self.top_k] if did in all_docs]
+                    fusion_span.set_attr("unique_docs", len(all_docs))
+                    fusion_span.set_attr("output_count", len(result))
+                    if sorted_ids:
+                        fusion_span.set_attr("top_score", round(sorted_ids[0][1], 6))
+                        fusion_span.set_attr("bottom_score", round(sorted_ids[min(len(sorted_ids)-1, self.top_k-1)][1], 6))
+                    # Log overlap between retrievers
+                    sem_ids = {d.metadata.get("article_id", "") for d in semantic_docs}
+                    bm25_ids = {d.metadata.get("article_id", "") for d in bm25_docs}
+                    meta_ids = {d.metadata.get("article_id", "") for d in meta_docs}
+                    fusion_span.set_attr("overlap_sem_bm25", len(sem_ids & bm25_ids))
+                    fusion_span.set_attr("overlap_sem_meta", len(sem_ids & meta_ids))
+                    fusion_span.set_attr("overlap_bm25_meta", len(bm25_ids & meta_ids))
+                    fusion_span.set_attr("overlap_all_three", len(sem_ids & bm25_ids & meta_ids))
+
                 span.set_attr("fused_count", len(result))
                 if result:
                     span.set_attr("top_articles", ", ".join(d.metadata.get("article_number", "?") for d in result[:5]))
+                    # Log which laws are represented
+                    laws = set(d.metadata.get("law_name", "?") for d in result)
+                    span.set_attr("laws_represented", ", ".join(laws))
                 return result
         async def _aget_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
             return self._get_relevant_documents(query, run_manager=run_manager)
@@ -540,20 +650,30 @@ def initialize_rag_pipeline():
     if not os.path.exists(RERANKER_DIR):
         raise FileNotFoundError(f"Reranker not found: {RERANKER_DIR}")
 
-    cross_encoder = HuggingFaceCrossEncoder(model_name=RERANKER_DIR)
-    compressor = CrossEncoderReranker(model=cross_encoder, top_n=RERANKER_TOP_N)
-    _base_compression = ContextualCompressionRetriever(base_compressor=compressor, base_retriever=hybrid_retriever)
+    with PhoenixSpan("reranker_model_load", {"model_dir": RERANKER_DIR, "top_n": RERANKER_TOP_N}) as rr_span:
+        cross_encoder = HuggingFaceCrossEncoder(model_name=RERANKER_DIR)
+        compressor = CrossEncoderReranker(model=cross_encoder, top_n=RERANKER_TOP_N)
+        _base_compression = ContextualCompressionRetriever(base_compressor=compressor, base_retriever=hybrid_retriever)
+        rr_span.set_attr("status", "loaded")
 
     class InstrumentedCompressionRetriever(BaseRetriever):
         base_retriever: ContextualCompressionRetriever
         class Config:
             arbitrary_types_allowed = True
         def _get_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
-            with PhoenixSpan("reranker_compression", {"query": query[:200], "top_n": RERANKER_TOP_N}) as span:
+            with PhoenixSpan("reranker_compression", {
+                "query": query[:200],
+                "top_n": RERANKER_TOP_N,
+                "model": "ARM-V1",
+            }) as span:
                 docs = self.base_retriever.invoke(query)
+                span.set_attr("input_count", RRF_TOP_K)
                 span.set_attr("output_count", len(docs))
                 if docs:
                     span.set_attr("articles", ", ".join(d.metadata.get("article_number", "?") for d in docs))
+                    span.set_attr("laws", ", ".join(set(d.metadata.get("law_name", "?") for d in docs)))
+                    # Estimate relevance by checking how many unique laws appear
+                    span.set_attr("unique_laws_count", len(set(d.metadata.get("law_name", "") for d in docs)))
                 return docs
         async def _aget_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
             return self._get_relevant_documents(query, run_manager=run_manager)
@@ -562,8 +682,11 @@ def initialize_rag_pipeline():
     print(f"✅ Reranker ready (top_n={RERANKER_TOP_N})")
 
     # ── 8. LLM ───────────────────────────────────────────────────
+    _groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not _groq_key:
+        raise RuntimeError("GROQ_API_KEY not set in environment / .env file")
     llm = ChatGroq(
-        groq_api_key=os.getenv("GROQ_API_KEY"),
+        groq_api_key=_groq_key,
         model_name=LLM_MODEL,
         temperature=LLM_TEMPERATURE,
         model_kwargs={"top_p": LLM_TOP_P},
@@ -585,11 +708,11 @@ def initialize_rag_pipeline():
 
     qa_chain = (
         RunnableParallel({
-            "context": compression_retriever,
-            "input": RunnablePassthrough(),
+            "context": (lambda x: x["input"]) | compression_retriever,
+            "input": lambda x: x["input"],
+            "chat_history": lambda x: x.get("chat_history", []),
         })
         .assign(
-            chat_history=lambda x: x.get("chat_history", []),
             answer=(
                 RunnableLambda(lambda x: {
                     "context": _format_context(x["context"]),
@@ -602,7 +725,21 @@ def initialize_rag_pipeline():
             ),
         )
     )
-    print("✅ System ready!")
+
+    # ── Log total initialization time ────────────────────────────
+    _init_duration = round((time.time() - _init_t0) * 1000, 2)
+    with PhoenixSpan("pipeline_initialization_complete", {
+        "embedding_model": EMBEDDING_MODEL,
+        "llm_model": LLM_MODEL,
+        "total_docs": len(docs),
+        "total_init_ms": _init_duration,
+        "chroma_dir": CHROMA_DIR,
+        "reranker_top_n": RERANKER_TOP_N,
+        "rrf_top_k": RRF_TOP_K,
+        "chat_history_turns": CHAT_HISTORY_TURNS,
+    }) as final_span:
+        final_span.set_attr("status", "ready")
+    print(f"✅ System ready! (init: {_init_duration:.0f}ms)")
     return qa_chain
 
 
@@ -630,61 +767,130 @@ if prompt_input := st.chat_input("اكتب سؤالك القانوني هنا…
     with st.chat_message("assistant"):
         with st.spinner("جاري التحليل القانوني…"):
             try:
-                history = format_chat_history(st.session_state.messages[:-1])
-
+                # ════════════════════════════════════════════════════
+                # ROOT SPAN — every child span nests under this tree
+                # ════════════════════════════════════════════════════
                 with PhoenixSpan("chat_request", {
-                    "question": prompt_input[:300],
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "question": prompt_input[:500],
+                    "question_length": len(prompt_input),
+                    "session_messages": len(st.session_state.messages),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                 }, kind="SERVER") as req_span:
-                    result = qa_chain.invoke({"input": prompt_input, "chat_history": history})
 
-                    response_text = result.get("answer", "") if isinstance(result, dict) else str(result)
-                    source_docs = result.get("context", []) if isinstance(result, dict) else []
+                    # ├─ 1. chat_history_format
+                    with PhoenixSpan("chat_history_format", {
+                        "raw_messages": len(st.session_state.messages) - 1,
+                        "max_turns": CHAT_HISTORY_TURNS,
+                    }) as hist_span:
+                        history = format_chat_history(st.session_state.messages[:-1])
+                        hist_span.set_attr("formatted_messages", len(history))
+                        hist_span.set_attr("has_history", len(history) > 0)
 
-                    req_span.set_attr("context_count", len(source_docs))
-                    if source_docs:
-                        req_span.set_attr("articles", ", ".join(d.metadata.get("article_number", "?") for d in source_docs[:10]))
+                    req_span.set_attr("chat_history_turns", len(history) // 2)
 
+                    # ├─ 2. chain_invoke
+                    # │   ├─ hybrid_retrieval  (auto-nested from retriever)
+                    # │   │   ├─ semantic_retrieval
+                    # │   │   ├─ bm25_retrieval
+                    # │   │   ├─ metadata_retrieval
+                    # │   │   └─ rrf_fusion
+                    # │   ├─ reranker_compression  (auto-nested from retriever)
+                    # │   └─ llm_call  (Groq API)
+                    with PhoenixSpan("chain_invoke", {
+                        "input": prompt_input[:300],
+                        "history_messages": len(history),
+                    }) as chain_span:
+                        result = qa_chain.invoke({"input": prompt_input, "chat_history": history})
+
+                        response_text = result.get("answer", "") if isinstance(result, dict) else str(result)
+                        source_docs = result.get("context", []) if isinstance(result, dict) else []
+
+                        chain_span.set_attr("answer_length", len(response_text))
+                        chain_span.set_attr("context_docs", len(source_docs))
+
+                    # ├─ 3. retrieval_quality
+                    with PhoenixSpan("retrieval_quality", {
+                        "context_count": len(source_docs),
+                    }) as qual_span:
+                        if source_docs:
+                            articles = [d.metadata.get("article_number", "?") for d in source_docs]
+                            laws = [d.metadata.get("law_name", "?") for d in source_docs]
+                            natures = [d.metadata.get("legal_nature", "?") for d in source_docs]
+                            qual_span.set_attr("articles", ", ".join(articles))
+                            qual_span.set_attr("laws", ", ".join(set(laws)))
+                            qual_span.set_attr("legal_natures", ", ".join(set(n for n in natures if n)))
+                            qual_span.set_attr("unique_laws", len(set(laws)))
+                            qual_span.set_attr("unique_articles", len(set(articles)))
+                            total_ctx_chars = sum(len(d.page_content) for d in source_docs)
+                            qual_span.set_attr("total_context_chars", total_ctx_chars)
+                        else:
+                            qual_span.set_attr("status", "no_context_found")
+
+                    # ├─ 4. llm_generation (post-hoc analysis)
                     with PhoenixSpan("llm_generation", {
                         "model": LLM_MODEL,
                         "temperature": LLM_TEMPERATURE,
+                        "top_p": LLM_TOP_P,
                     }, kind="CLIENT") as llm_span:
-                        llm_span.set_attr("response_len", len(response_text))
+                        llm_span.set_attr("response_length", len(response_text))
                         llm_span.set_attr("response_preview", response_text[:500])
+                        citation_count = len(re.findall(r"(?:مادة|المادة)\s*\d+", response_text))
+                        llm_span.set_attr("citation_count", citation_count)
+                        llm_span.set_attr("has_citations", citation_count > 0)
 
-                st.markdown(convert_to_eastern_arabic(response_text))
+                    # ├─ 5. response_rendering
+                    with PhoenixSpan("response_rendering", {
+                        "answer_length": len(response_text),
+                        "source_docs": len(source_docs),
+                    }) as render_span:
+                        st.markdown(convert_to_eastern_arabic(response_text))
 
-                if source_docs:
-                    seen: Set[str] = set()
-                    unique_docs: List[Document] = []
-                    for doc in source_docs:
-                        art_num = str(doc.metadata.get("article_number", "")).strip()
-                        if art_num and art_num not in seen:
-                            seen.add(art_num)
-                            unique_docs.append(doc)
-                    st.markdown("---")
-                    if unique_docs:
-                        with st.expander(f"📚 المصادر ({len(unique_docs)} مادة)"):
-                            for doc in unique_docs:
+                        if source_docs:
+                            seen: Set[str] = set()
+                            unique_docs: List[Document] = []
+                            for doc in source_docs:
                                 art_num = str(doc.metadata.get("article_number", "")).strip()
-                                law = doc.metadata.get("law_name", "")
-                                nature = doc.metadata.get("legal_nature", "")
-                                header = f"**المادة رقم {convert_to_eastern_arabic(art_num)}**"
-                                if law:
-                                    header += f" — {law}"
-                                st.markdown(header)
-                                if nature:
-                                    st.markdown(f"*{nature}*")
-                                for line in doc.page_content.strip().split("\n"):
-                                    line = line.strip()
-                                    if line:
-                                        st.markdown(convert_to_eastern_arabic(line))
-                                st.markdown("---")
-                    else:
-                        st.info("📌 لم يتم العثور على مصادر")
-                else:
-                    st.info("📌 لم يتم العثور على مصادر")
+                                if art_num and art_num not in seen:
+                                    seen.add(art_num)
+                                    unique_docs.append(doc)
+
+                            render_span.set_attr("unique_source_count", len(unique_docs))
+                            st.markdown("---")
+                            if unique_docs:
+                                with st.expander(f"📚 المصادر ({len(unique_docs)} مادة)"):
+                                    for doc in unique_docs:
+                                        art_num = str(doc.metadata.get("article_number", "")).strip()
+                                        law = doc.metadata.get("law_name", "")
+                                        nature = doc.metadata.get("legal_nature", "")
+                                        header = f"**المادة رقم {convert_to_eastern_arabic(art_num)}**"
+                                        if law:
+                                            header += f" — {law}"
+                                        st.markdown(header)
+                                        if nature:
+                                            st.markdown(f"*{nature}*")
+                                        for line in doc.page_content.strip().split("\n"):
+                                            line = line.strip()
+                                            if line:
+                                                st.markdown(convert_to_eastern_arabic(line))
+                                        st.markdown("---")
+                            else:
+                                st.info("📌 لم يتم العثور على مصادر")
+                        else:
+                            st.info("📌 لم يتم العثور على مصادر")
+
+                    # └─ Summary on root span
+                    req_span.set_attr("answer_length", len(response_text))
+                    req_span.set_attr("context_count", len(source_docs))
+                    req_span.set_attr("response_preview", response_text[:300])
+                    req_span.set_attr("status", "success")
 
                 st.session_state.messages.append({"role": "assistant", "content": response_text})
             except Exception as e:
+                if _phoenix_tracer:
+                    with PhoenixSpan("chat_request_error", {
+                        "question": prompt_input[:300],
+                        "error_type": type(e).__name__,
+                        "error_message": str(e)[:500],
+                    }) as err_span:
+                        pass
                 st.error(f"حدث خطأ: {e}")
