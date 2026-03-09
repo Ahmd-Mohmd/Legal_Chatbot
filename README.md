@@ -38,7 +38,7 @@ This project is a **graduation project** that implements an AI-powered legal ass
 - **Cross-Encoder Reranking** — Arabic-tuned ARM-V1 reranker for high-precision document selection
 - **Conversational Memory** — Last 3 Q&A turns preserved for follow-up questions
 - **A/B Embedding Comparison** — Switch between GATE-AraBert-v1 and Arabic-Triplet-Matryoshka-V2 via environment variable
-- **Multi-Key Evaluation** — 4 Groq API keys with round-robin rotation for faster evaluation
+- **Multi-Key Evaluation** — 3 Groq API keys with round-robin rotation for faster evaluation
 - **Full Observability** — Optional Arize Phoenix tracing via OpenTelemetry
 
 ---
@@ -133,7 +133,7 @@ All law files are stored in the `data/` directory as structured JSON with articl
 📂 Chatbot_me/
 ├── 📄 app_final_updated.py          # Main Streamlit app (production)
 ├── 📄 app_final_pheonix.py          # Streamlit app + Phoenix tracing
-├── 📄 evaluate_rag.py               # RAG evaluation with 4-key rotation
+├── 📄 evaluate_rag.py               # RAG evaluation with 3-key rotation
 ├── 📄 requirements.txt              # Python dependencies
 ├── 📄 README.md                     # This file
 ├── 📄 ragas_dataset_100.csv         # 100-question evaluation dataset
@@ -219,7 +219,6 @@ GROQ_API_KEY=gsk_your_primary_key_here
 # Additional keys for evaluation (optional, improves throughput)
 groq_api=gsk_your_second_key
 groq_api_2=gsk_your_third_key
-groq_api_3=gsk_your_fourth_key
 
 # A/B Embedding Switch (optional)
 # EMBEDDING_MODEL=Omartificial-Intelligence-Space/Arabic-Triplet-Matryoshka-V2
@@ -285,10 +284,10 @@ python evaluate_rag.py
 
 ### Multi-Key Throughput
 
-The evaluation script loads **all 4 Groq API keys** from `.env` and rotates through them:
+The evaluation script loads **all 3 Groq API keys** from `.env` and rotates through them:
 
 - **Single key**: ~30 RPM → ~45 min for 100 questions
-- **4 keys**: ~120 RPM → ~15 min for 100 questions
+- **3 keys**: ~90 RPM → ~20 min for 100 questions
 
 If a key hits rate limits (429), the script automatically falls back to the next key.
 

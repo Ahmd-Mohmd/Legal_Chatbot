@@ -1,6 +1,9 @@
 # Archive (old/redundant files)
 archive/
 
+# Cached embedding model weights
+embedding_cache/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -22,6 +25,7 @@ reranker/
 
 # Vector database
 chroma_db/
+chroma_db_*/
 
 # Data files - CSV
 *.csv
